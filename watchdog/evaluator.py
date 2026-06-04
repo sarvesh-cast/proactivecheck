@@ -1,9 +1,12 @@
-"""Evaluator module — feeds snapshot data to Claude for anomaly detection.
+"""Evaluator module — feeds snapshot data to an LLM for anomaly detection.
 
-Sends the collected snapshot + trailing history to Claude Haiku (or Sonnet
-for higher fidelity) as a single-shot evaluation. The model acts as an SRE
+Sends the collected snapshot + trailing history to an OpenAI-compatible
+LLM endpoint as a single-shot evaluation. The model acts as an SRE
 reviewing the cluster, classifies findings by severity, and outputs
 structured JSON.
+
+Supports any OpenAI-compatible API (CAST AI LLM proxy, OpenAI, Anthropic
+via proxy, local models, etc.) configured via LLM_BASE_URL.
 
 Handles: LLM API failures (retry once, fallback to raw metrics), malformed
 JSON responses (regex extraction fallback), and token budget management.
@@ -11,12 +14,13 @@ JSON responses (regex extraction fallback), and token budget management.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from typing import Any
 
-import httpx
+from openai import AsyncOpenAI
 
 from .config import WatchdogConfig
 from .models import (
@@ -151,13 +155,17 @@ data as a cluster problem — it's an observability gap."""
 
 
 class Evaluator:
-    """Evaluates cluster snapshots using Claude."""
+    """Evaluates cluster snapshots using an OpenAI-compatible LLM."""
 
     def __init__(self, config: WatchdogConfig) -> None:
         self.config = config
-        self.api_key = config.anthropic.api_key
-        self.model = config.anthropic.model
-        self.fallback_model = config.anthropic.fallback_model
+        self.model = config.llm.model
+        self.fallback_model = config.llm.fallback_model
+        self.client = AsyncOpenAI(
+            base_url=config.llm.base_url,
+            api_key=config.llm.api_key,
+            timeout=600.0,  # reasoning models need long thinking time
+        )
 
     async def evaluate(
         self,
@@ -168,6 +176,8 @@ class Evaluator:
         agent_restarts_last_hour: int = 0,
         memory_leaks: list[dict] | None = None,
         mature_data_gaps: list[dict] | None = None,
+        mature_pending_pods: list[dict] | None = None,
+        oomkill_trend: list[int] | None = None,
     ) -> EvaluationResult:
         """Send snapshot to Claude and parse the structured response."""
 
@@ -185,60 +195,81 @@ class Evaluator:
             else "None — all data sources collected successfully.",
         )
 
-        # Try primary model, fall back if needed
-        for model in [self.model, self.fallback_model]:
-            try:
-                result = await self._call_anthropic(prompt, model)
-                if result:
-                    return result
-            except Exception as e:
-                logger.warning("Model %s failed: %s", model, e)
-                continue
-
-        # Both models failed — return a raw metrics-only evaluation
-        logger.error("All LLM evaluations failed, producing raw metrics fallback")
-        return self._raw_metrics_fallback(
+        # Build raw metrics result for validation & fallback
+        raw_result = self._raw_metrics_fallback(
             snapshot, node_count_delta_pct, pod_count_delta_pct,
             agent_restarts_last_hour, memory_leaks or [],
-            mature_data_gaps or [],
+            mature_data_gaps or [], oomkill_trend or [],
+            mature_pending_pods=mature_pending_pods or [],
         )
 
-    async def _call_anthropic(
+        # Try primary model with retries, then fallback model with retries
+        for model in [self.model, self.fallback_model]:
+            for attempt in range(1, 4):  # 3 attempts per model
+                try:
+                    result = await self._call_llm(prompt, model)
+                    if result:
+                        # Cross-check LLM findings against raw data
+                        validated = self._validate_llm_result(result, raw_result, snapshot)
+                        return validated
+                    # JSON parse failed — retry with same model before switching
+                    if attempt < 3:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "Model %s returned unparseable response (attempt %d/3), retrying in %ds",
+                            model, attempt, wait,
+                        )
+                        await asyncio.sleep(wait)
+                except Exception as e:
+                    if attempt < 3:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "Model %s failed (attempt %d/3): %s, retrying in %ds",
+                            model, attempt, e, wait,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning("Model %s failed after 3 attempts: %s", model, e)
+                    continue
+
+        # Both models failed — return raw metrics-only evaluation
+        logger.error("All LLM evaluations failed, producing raw metrics fallback")
+        return raw_result
+
+    async def _call_llm(
         self, prompt: str, model: str
     ) -> EvaluationResult | None:
-        """Call the Anthropic Messages API and parse the response."""
+        """Call an OpenAI-compatible chat completions endpoint and parse the response."""
         logger.debug(
-            "Sending prompt to %s: %d chars (~%d tokens)",
-            model, len(prompt), len(prompt) // 4,
+            "Sending prompt to %s (%s): %d chars (~%d tokens)",
+            model, self.config.llm.base_url, len(prompt), len(prompt) // 4,
         )
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": self.api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "max_tokens": self.config.anthropic.max_tokens,
-                    "temperature": self.config.anthropic.temperature,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
+        try:
+            completion = await self.client.chat.completions.create(
+                model=model,
+                max_tokens=self.config.llm.max_tokens,
+                temperature=self.config.llm.temperature,
+                messages=[{"role": "user", "content": prompt}],
             )
-            if resp.status_code != 200:
-                logger.error(
-                    "Anthropic %s returned %d: %s",
-                    model, resp.status_code, resp.text[:500],
-                )
-            resp.raise_for_status()
-            data = resp.json()
+        except Exception as e:
+            logger.error("LLM %s request failed: %s", model, e)
+            raise
 
-        # Extract text content
-        text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                text += block["text"]
+        msg = completion.choices[0].message if completion.choices else None
+        text = (msg.content or "") if msg else ""
+
+        # Reasoning models (kimi, deepseek-r1, etc.) may put the answer
+        # in reasoning_content when content is empty/null
+        if not text and msg:
+            rc = getattr(msg, "reasoning_content", None)
+            if not rc:
+                # Also check provider_specific_fields (raw API passthrough)
+                psf = getattr(msg, "provider_specific_fields", None) or {}
+                if isinstance(psf, dict):
+                    rc = psf.get("reasoning_content") or psf.get("reasoning")
+            if rc:
+                logger.info("Using reasoning_content as primary response from %s", model)
+                text = rc
 
         if not text:
             logger.error("Empty response from %s", model)
@@ -247,13 +278,16 @@ class Evaluator:
         # Parse JSON from the response
         parsed = self._parse_llm_json(text)
         if not parsed:
-            logger.error("Failed to parse JSON from %s response", model)
+            logger.error(
+                "Failed to parse JSON from %s response. First 500 chars: %.500s",
+                model, text,
+            )
             return None
 
         return self._build_result(parsed, model, text)
 
     def _parse_llm_json(self, text: str) -> dict | None:
-        """Extract JSON from LLM response, handling markdown fences and preamble."""
+        """Extract JSON from LLM response, handling markdown fences, preamble, and partial output."""
         # Try 1: direct parse
         try:
             return json.loads(text)
@@ -268,7 +302,37 @@ class Evaluator:
             except json.JSONDecodeError:
                 pass
 
-        # Try 3: find the first { ... } block
+        # Try 3: brace-matched extraction — find the first top-level { } block
+        start = text.find("{")
+        if start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(text)):
+                c = text[i]
+                if escape:
+                    escape = False
+                    continue  # skip escaped character entirely
+                if c == "\\":
+                    if in_string:
+                        escape = True
+                    continue
+                if c == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+
+        # Try 4: greedy regex fallback
         brace_match = re.search(r"\{.*\}", text, re.DOTALL)
         if brace_match:
             try:
@@ -276,6 +340,18 @@ class Evaluator:
             except json.JSONDecodeError:
                 pass
 
+        # Try 5: truncated JSON — model hit token limit mid-output
+        # Find the last complete "findings" entry and close the structure
+        if '"findings"' in text and start is not None:
+            truncated = text[start:] if start != -1 else text
+            # Close any open arrays/objects
+            for suffix in [']}]}', '"]}]}', '"}]}', '"]}}']:
+                try:
+                    return json.loads(truncated + suffix)
+                except json.JSONDecodeError:
+                    continue
+
+        logger.debug("Unparseable LLM response (first 1000 chars): %.1000s", text)
         return None
 
     def _build_result(
@@ -285,9 +361,18 @@ class Evaluator:
         findings = []
         for f in parsed.get("findings", []):
             try:
+                try:
+                    category = FindingCategory(f.get("category", "other"))
+                except ValueError:
+                    logger.info("Unknown category '%s', mapping to OTHER", f.get("category"))
+                    category = FindingCategory.OTHER
+                try:
+                    severity = Severity(f.get("severity", "info"))
+                except ValueError:
+                    severity = Severity.INFO
                 findings.append(Finding(
-                    severity=Severity(f.get("severity", "info")),
-                    category=FindingCategory(f.get("category", "other")),
+                    severity=severity,
+                    category=category,
                     workload=f.get("workload", "unknown"),
                     what=f.get("what", ""),
                     evidence=f.get("evidence", ""),
@@ -324,6 +409,190 @@ class Evaluator:
             raw_response=raw[:2000],  # truncate for storage
         )
 
+    def _validate_llm_result(
+        self,
+        llm_result: EvaluationResult,
+        raw_result: EvaluationResult,
+        snapshot: SnapshotData,
+    ) -> EvaluationResult:
+        """Cross-check LLM findings against raw snapshot data to eliminate hallucinations.
+
+        For each LLM finding, verify that the underlying data supports it.
+        Then merge in any real findings from raw metrics that the LLM missed.
+        """
+        # Build lookup sets from actual snapshot data for fast validation
+        oom_workloads = set()
+        for o in snapshot.oomkilled_pods:
+            ns = o.get("namespace", "")
+            name = o.get("name", o.get("workload_name", ""))
+            if ns and name:
+                oom_workloads.add(f"{ns}/{name}")
+            # Also add partial matches (just the workload name)
+            if name:
+                oom_workloads.add(name)
+
+        mismatch_workloads = {m.get("workload", "") for m in snapshot.recommendation_mismatches}
+        absurd_workloads = {a.get("workload", "") for a in snapshot.absurd_recommendations}
+        data_gap_workloads = {d.get("workload", "") for d in snapshot.data_gaps}
+
+        agent_names = {a.get("name", "") for a in snapshot.agent_pods}
+        agent_not_running = any(a.get("phase") != "Running" for a in snapshot.agent_pods)
+
+        # Validate each LLM finding
+        validated = []
+        dropped = 0
+
+        for finding in llm_result.findings:
+            cat = finding.category
+            wl = finding.workload
+
+            # Extract the workload name (last segment after /)
+            wl_name = wl.split("/")[-1] if "/" in wl else wl
+
+            keep = False
+
+            if cat == FindingCategory.OOMKILL:
+                # Must match an actual OOMKilled pod
+                keep = (
+                    wl in oom_workloads
+                    or wl_name in oom_workloads
+                    or any(wl_name in ow for ow in oom_workloads)
+                    or len(snapshot.oomkilled_pods) > 0 and wl == "cluster-level"
+                )
+
+            elif cat == FindingCategory.MISMATCH:
+                keep = wl in mismatch_workloads or any(wl_name in m for m in mismatch_workloads)
+
+            elif cat == FindingCategory.ABSURD_RECOMMENDATION:
+                keep = wl in absurd_workloads or any(wl_name in a for a in absurd_workloads)
+
+            elif cat == FindingCategory.UNSCHEDULABLE:
+                keep = snapshot.pending_pods > 0
+
+            elif cat in (FindingCategory.AGENT, FindingCategory.AGENT_RESTART):
+                keep = (
+                    agent_not_running
+                    or snapshot.agent_restarts_last_hour > 0
+                    or any(wl_name in an for an in agent_names)
+                    or wl in ("cluster-level", "castai-system", "org-level")
+                )
+
+            elif cat == FindingCategory.DATA_GAP:
+                keep = len(snapshot.data_gaps) > 0 or wl in data_gap_workloads
+
+            elif cat == FindingCategory.MEMORY_LEAK:
+                # Trust the LLM if we have memory usage data at all
+                keep = len(snapshot.workload_memory_usage) > 0
+
+            elif cat == FindingCategory.CASCADING_SCALING:
+                keep = True  # Validated by node/pod delta in raw metrics
+
+            elif cat == FindingCategory.WEBHOOK_FAILURE:
+                keep = any(
+                    s.get("signal") in ("webhook_exporter_failure", "wa_mutation_errors")
+                    for s in snapshot.log_signals
+                )
+
+            elif cat in (FindingCategory.UNHEALTHY_DEPLOYMENT, FindingCategory.CONFIG, FindingCategory.OTHER):
+                # Generic categories — keep if any log signal or deployment issue exists
+                keep = True
+
+            if keep:
+                validated.append(finding)
+            else:
+                dropped += 1
+                logger.warning(
+                    "Dropped hallucinated finding: [%s] %s on %s — no supporting data in snapshot",
+                    finding.severity.value, finding.category.value, finding.workload,
+                )
+
+        # Replace grouped LLM findings with per-workload raw findings.
+        # When the LLM lumps N workloads into one cluster-level finding
+        # but the raw fallback has per-workload detail, prefer the raw detail.
+        _expandable = {
+            FindingCategory.DATA_GAP, FindingCategory.MISMATCH,
+            FindingCategory.ABSURD_RECOMMENDATION, FindingCategory.UNSCHEDULABLE,
+            FindingCategory.OOMKILL, FindingCategory.OTHER,
+        }
+        raw_by_cat: dict[str, list[Finding]] = {}
+        for rf in raw_result.findings:
+            raw_by_cat.setdefault(rf.category.value, []).append(rf)
+
+        # Build set of per-workload names from raw findings for comparison
+        raw_workloads_by_cat: dict[str, set[str]] = {}
+        for rf in raw_result.findings:
+            raw_workloads_by_cat.setdefault(rf.category.value, set()).add(rf.workload)
+
+        expanded = []
+        expanded_cats = set()
+        for f in validated:
+            # Check if this LLM finding is a grouped/summarized one
+            # (e.g. "multiple (10 workloads)") rather than per-workload
+            raw_wl_names = raw_workloads_by_cat.get(f.category.value, set())
+            is_grouped = (
+                f.category in _expandable
+                and f.category.value in raw_by_cat
+                and len(raw_by_cat[f.category.value]) > 1
+                and f.workload not in raw_wl_names
+                and (
+                    any(
+                        kw in f.workload.lower()
+                        for kw in ("cluster-level", "multiple", "workload")
+                    )
+                    or f.workload == "cluster-level"
+                )
+            )
+            if is_grouped and f.category.value not in expanded_cats:
+                # Replace with per-workload raw findings
+                expanded.extend(raw_by_cat[f.category.value])
+                expanded_cats.add(f.category.value)
+            else:
+                expanded.append(f)
+        validated = expanded
+
+        # Merge in raw-metrics findings the LLM missed entirely
+        llm_categories_workloads = {
+            (f.category.value, f.workload) for f in validated
+        }
+        merged_from_raw = 0
+        for raw_finding in raw_result.findings:
+            key = (raw_finding.category.value, raw_finding.workload)
+            if key not in llm_categories_workloads:
+                if raw_finding.workload == "cluster-level":
+                    if any(f.category == raw_finding.category for f in validated):
+                        continue
+                validated.append(raw_finding)
+                merged_from_raw += 1
+
+        if dropped or merged_from_raw:
+            logger.info(
+                "Validation: %d LLM findings kept, %d hallucinations dropped, %d raw findings merged",
+                len(validated) - merged_from_raw, dropped, merged_from_raw,
+            )
+
+        # Recompute verdict from validated findings
+        verdict = Verdict.HEALTHY
+        for f in validated:
+            if f.severity == Severity.CRITICAL:
+                verdict = Verdict.CRITICAL
+                break
+            if f.severity == Severity.WARNING:
+                verdict = Verdict.WARNING
+
+        # Update summary if findings changed significantly
+        summary = llm_result.summary
+        if dropped > 0:
+            summary = f"[Validated: {dropped} hallucinated finding(s) removed] {summary}"
+
+        return EvaluationResult(
+            verdict=verdict,
+            summary=summary,
+            findings=validated,
+            metrics=llm_result.metrics,
+            model_used=f"{llm_result.model_used}+validated",
+            raw_response=llm_result.raw_response,
+        )
+
     def _raw_metrics_fallback(
         self,
         snapshot: SnapshotData,
@@ -332,6 +601,8 @@ class Evaluator:
         agent_restarts_last_hour: int = 0,
         memory_leaks: list[dict] | None = None,
         mature_data_gaps: list[dict] | None = None,
+        oomkill_trend: list[int] | None = None,
+        mature_pending_pods: list[dict] | None = None,
     ) -> EvaluationResult:
         """Produce a deterministic evaluation from raw data when LLM is unavailable.
 
@@ -371,29 +642,67 @@ class Evaluator:
                 suggested_action="Monitor closely; check if count increases next cycle",
             ))
 
+        # OOMKill escalating trend: 3+ consecutive snapshots with increasing OOM count
+        trend = oomkill_trend or []
+        if len(trend) >= 3:
+            recent = trend[-3:]
+            if recent[-1] > 0 and all(recent[i] > recent[i - 1] for i in range(1, len(recent))):
+                _escalate(Severity.CRITICAL)
+                findings.append(Finding(
+                    severity=Severity.CRITICAL,
+                    category=FindingCategory.OOMKILL,
+                    workload="cluster-level",
+                    what=f"OOMKill count escalating across {len(recent)} snapshots: {recent}",
+                    evidence=f"oomkill_trend={trend}",
+                    suggested_action="OOMKill spiral detected — investigate affected workloads immediately",
+                ))
+
         # ── 2. Recommendation/actual mismatch ────────────────────────
         for mm in snapshot.recommendation_mismatches:
             _escalate(Severity.CRITICAL)
+            woop_info = f" [{mm['woop']}]" if mm.get("woop") else ""
             findings.append(Finding(
                 severity=Severity.CRITICAL,
                 category=FindingCategory.MISMATCH,
-                workload=mm["workload"],
-                what=f"Recommendation/actual mismatch ({mm['diff_pct']}% divergence)",
+                workload=mm.get("workload", "unknown"),
+                what=f"Recommendation/actual mismatch ({mm.get('diff_pct', '?')}% divergence){woop_info}",
                 evidence=json.dumps(mm),
                 suggested_action="Disable WOOP for this workload and investigate",
             ))
 
-        # ── 3. Unschedulable workloads ───────────────────────────────
-        if snapshot.pending_pods > 0:
-            sev = Severity.CRITICAL if snapshot.pending_pods > 5 else Severity.WARNING
-            _escalate(sev)
+        # ── 3. Unschedulable workloads (>15 min = CRITICAL) ──────────
+        m_pending = mature_pending_pods or []
+        if m_pending:
+            # Pods stuck Pending for >15 minutes — per-pod findings
+            _escalate(Severity.CRITICAL)
+            for p in m_pending[:10]:
+                findings.append(Finding(
+                    severity=Severity.CRITICAL,
+                    category=FindingCategory.UNSCHEDULABLE,
+                    workload=f"{p.get('namespace', '')}/{p.get('name', '')}",
+                    what=f"Pod Pending for {p.get('age_minutes', 0):.0f} min — {p.get('reason', 'unknown reason')}",
+                    evidence=json.dumps(p),
+                    suggested_action="Check node capacity and resource requests",
+                ))
+            remaining = len(m_pending) - 10
+            if remaining > 0:
+                findings.append(Finding(
+                    severity=Severity.INFO,
+                    category=FindingCategory.UNSCHEDULABLE,
+                    workload="cluster-level",
+                    what=f"+{remaining} more pod(s) Pending >15 min",
+                    evidence=f"total_mature_pending={len(m_pending)}",
+                    suggested_action="Review all stuck Pending pods in console",
+                ))
+        elif snapshot.pending_pods > 0:
+            # Fresh Pending pods (< 15 min) — INFO only, don't escalate
             findings.append(Finding(
-                severity=sev,
+                severity=Severity.INFO,
                 category=FindingCategory.UNSCHEDULABLE,
                 workload="cluster-level",
-                what=f"{snapshot.pending_pods} pods in Pending state",
-                evidence=f"pending_pods={snapshot.pending_pods}",
-                suggested_action="Check node capacity and resource requests",
+                what=f"{snapshot.pending_pods} pod(s) in Pending state (< 15 min)",
+                evidence=json.dumps(snapshot.pending_pods_detail[:5]),
+                suggested_action="Monitor — will escalate to CRITICAL if still Pending after 15 min",
             ))
 
         # ── 4. Agent down ────────────────────────────────────────────
@@ -403,7 +712,7 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
                     category=FindingCategory.AGENT,
-                    workload=f"castai-system/{agent['name']}",
+                    workload=f"castai-system/{agent.get('name', 'unknown')}",
                     what=f"CAST AI agent pod not Running (phase={agent.get('phase')})",
                     evidence=json.dumps(agent),
                     suggested_action="Check agent pod logs and events immediately",
@@ -417,7 +726,7 @@ class Evaluator:
                     severity=Severity.CRITICAL,
                     category=FindingCategory.AGENT,
                     workload="org-level",
-                    what=f"{sig['count']} cluster(s) with agent not online",
+                    what=f"{sig.get('count', '?')} cluster(s) with agent not online",
                     evidence=json.dumps(sig.get("sample", [])[:3]),
                     suggested_action="Check agent status on offline clusters",
                 ))
@@ -426,24 +735,49 @@ class Evaluator:
         mgaps = mature_data_gaps or []
         if mgaps:
             _escalate(Severity.WARNING)
-            findings.append(Finding(
-                severity=Severity.WARNING,
-                category=FindingCategory.DATA_GAP,
-                workload="cluster-level",
-                what=f"{len(mgaps)} MANAGED workload(s) with no recommendation for >2 hours",
-                evidence=json.dumps(mgaps[:5]),
-                suggested_action="Check WOOP exporter health; workloads may not be getting optimized",
-            ))
+            for g in mgaps[:15]:
+                woop_info = f" [{g.get('woop', '')}]" if g.get("woop") else ""
+                age = g.get("age_hours", "?")
+                findings.append(Finding(
+                    severity=Severity.WARNING,
+                    category=FindingCategory.DATA_GAP,
+                    workload=g.get("workload", "unknown"),
+                    what=f"MANAGED{woop_info} — no recommendation for {age}h",
+                    evidence=json.dumps(g),
+                    suggested_action="Check WOOP exporter health; workload not being optimized",
+                ))
+            remaining = len(mgaps) - min(len(mgaps), 15)
+            if remaining > 0:
+                findings.append(Finding(
+                    severity=Severity.INFO,
+                    category=FindingCategory.DATA_GAP,
+                    workload="cluster-level",
+                    what=f"+{remaining} more MANAGED workload(s) with no recommendation for >2 hours",
+                    evidence=f"total_mature_data_gaps={len(mgaps)}",
+                    suggested_action="Review all data gaps in console",
+                ))
         elif snapshot.data_gaps:
-            # Fresh gaps (< 2 hours) — info-level only, don't escalate
-            findings.append(Finding(
-                severity=Severity.INFO,
-                category=FindingCategory.DATA_GAP,
-                workload="cluster-level",
-                what=f"{len(snapshot.data_gaps)} MANAGED workloads with no recommendation (< 2 hours)",
-                evidence=json.dumps(snapshot.data_gaps[:5]),
-                suggested_action="Monitor — will escalate to WARNING if gap persists beyond 2 hours",
-            ))
+            # Fresh gaps (< 2 hours) — INFO, show per-workload
+            for g in snapshot.data_gaps[:10]:
+                woop_info = f" [{g.get('woop', '')}]" if g.get("woop") else ""
+                findings.append(Finding(
+                    severity=Severity.INFO,
+                    category=FindingCategory.DATA_GAP,
+                    workload=g.get("workload", "unknown"),
+                    what=f"MANAGED{woop_info} — no recommendation (< 2 hours)",
+                    evidence=json.dumps(g),
+                    suggested_action="Monitor — will escalate to WARNING if gap persists beyond 2 hours",
+                ))
+            remaining = len(snapshot.data_gaps) - min(len(snapshot.data_gaps), 10)
+            if remaining > 0:
+                findings.append(Finding(
+                    severity=Severity.INFO,
+                    category=FindingCategory.DATA_GAP,
+                    workload="cluster-level",
+                    what=f"+{remaining} more MANAGED workload(s) with no recommendation (< 2 hours)",
+                    evidence=f"total_fresh_data_gaps={len(snapshot.data_gaps)}",
+                    suggested_action="Monitor — will escalate if gap persists",
+                ))
 
         # ── 6. Memory leak pattern ───────────────────────────────────
         for leak in (memory_leaks or []):
@@ -451,20 +785,21 @@ class Evaluator:
             findings.append(Finding(
                 severity=Severity.WARNING,
                 category=FindingCategory.MEMORY_LEAK,
-                workload=f"{leak['namespace']}/{leak['workload']}",
-                what=f"Memory request increasing across {len(leak['trend_mib'])} snapshots (+{leak['growth_pct']}%)",
-                evidence=f"trend_mib={leak['trend_mib']}",
+                workload=f"{leak.get('namespace', '?')}/{leak.get('workload', '?')}",
+                what=f"Memory request increasing across {len(leak.get('trend_mib', []))} snapshots (+{leak.get('growth_pct', '?')}%)",
+                evidence=f"trend_mib={leak.get('trend_mib', [])}",
                 suggested_action="Investigate application memory growth; may trigger OOM recovery compounding",
             ))
 
         # ── 7. Absurd recommendation ─────────────────────────────────
         for ar in snapshot.absurd_recommendations:
             _escalate(Severity.CRITICAL)
+            woop_info = f" [{ar['woop']}]" if ar.get("woop") else ""
             findings.append(Finding(
                 severity=Severity.CRITICAL,
                 category=FindingCategory.ABSURD_RECOMMENDATION,
-                workload=ar["workload"],
-                what=ar["reason"],
+                workload=ar.get("workload", "unknown"),
+                what=f"{ar.get('reason', 'absurd recommendation')}{woop_info}",
                 evidence=json.dumps(ar),
                 suggested_action="Disable WOOP for this workload immediately — likely runaway OOM recovery logic",
             ))
@@ -498,8 +833,8 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
                     category=FindingCategory.AGENT_RESTART,
-                    workload=f"castai-system/{agent['name']}",
-                    what=f"Agent has ExitCode:0 history with {agent['restart_count']} restarts — silent failure pattern",
+                    workload=f"castai-system/{agent.get('name', 'unknown')}",
+                    what=f"Agent has ExitCode:0 history with {agent.get('restart_count', 0)} restarts — silent failure pattern",
                     evidence=json.dumps(agent),
                     suggested_action="Investigate immediately — this pattern caused multi-day outages before",
                 ))
@@ -512,7 +847,7 @@ class Evaluator:
                     severity=Severity.WARNING,
                     category=FindingCategory.WEBHOOK_FAILURE,
                     workload="castai-system/workload-autoscaler",
-                    what=f"{sig['count']} webhook/exporter error(s) in last 15 min",
+                    what=f"{sig.get('count', 0)} webhook/exporter error(s) in last 15 min",
                     evidence=json.dumps(sig.get("sample", [])[:2]),
                     suggested_action="Check WA webhook and exporter health; recommendations may not be applied",
                 ))
@@ -522,35 +857,57 @@ class Evaluator:
                     severity=Severity.WARNING,
                     category=FindingCategory.WEBHOOK_FAILURE,
                     workload="castai-system/workload-autoscaler",
-                    what=f"{sig['count']} WA mutation error(s) — possible overflow or webhook issue",
+                    what=f"{sig.get('count', 0)} WA mutation error(s) — possible overflow or webhook issue",
                     evidence=json.dumps(sig.get("sample", [])[:2]),
                     suggested_action="Check for integer overflow in recommendations or webhook connectivity",
                 ))
 
-        # ── 10. Cascading scaling ────────────────────────────────────
-        if abs(node_count_delta_pct) > 50:
+        # ── 10. Cascading scaling (only on scale-UP, not consolidation) ──
+        if node_count_delta_pct > 50:
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,
                 category=FindingCategory.CASCADING_SCALING,
                 workload="cluster-level",
-                what=f"Node count changed by {node_count_delta_pct:+.0f}% vs. trailing average",
+                what=f"Node count spiked {node_count_delta_pct:+.0f}% vs. trailing average",
                 evidence=f"node_count={snapshot.node_count}, delta_pct={node_count_delta_pct:.1f}%",
                 suggested_action="Check for runaway autoscaler or cascading scaling event",
             ))
-        if abs(pod_count_delta_pct) > 50:
+        if pod_count_delta_pct > 50:
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,
                 category=FindingCategory.CASCADING_SCALING,
                 workload="cluster-level",
-                what=f"Pod count changed by {pod_count_delta_pct:+.0f}% vs. trailing average",
+                what=f"Pod count spiked {pod_count_delta_pct:+.0f}% vs. trailing average",
                 evidence=f"total_pods={snapshot.total_pods}, delta_pct={pod_count_delta_pct:.1f}%",
                 suggested_action="Check for unexpected deployment scaling or pod storm",
             ))
 
-        # ── CrashLoop check (not its own scenario but always important) ──
-        if snapshot.crashloop_pods > 0:
+        # ── CrashLoop check (per-workload detail) ─────────────────────
+        if snapshot.crashloop_pods_detail:
+            _escalate(Severity.CRITICAL)
+            for cl in snapshot.crashloop_pods_detail[:10]:
+                findings.append(Finding(
+                    severity=Severity.CRITICAL,
+                    category=FindingCategory.OTHER,
+                    workload=f"{cl['namespace']}/{cl['name']}",
+                    what=f"Container `{cl.get('container', '?')}` in CrashLoopBackOff (restarts: {cl.get('restart_count', 0)})",
+                    evidence=json.dumps(cl),
+                    suggested_action="Check pod logs and events — all replicas may be down",
+                ))
+            remaining = snapshot.crashloop_pods - len(snapshot.crashloop_pods_detail[:10])
+            if remaining > 0:
+                findings.append(Finding(
+                    severity=Severity.INFO,
+                    category=FindingCategory.OTHER,
+                    workload="cluster-level",
+                    what=f"+{remaining} more pod(s) in CrashLoopBackOff",
+                    evidence=f"crashloop_pods={snapshot.crashloop_pods}",
+                    suggested_action="Review all CrashLooping pods in console",
+                ))
+        elif snapshot.crashloop_pods > 0:
+            # Fallback if detail not available
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,
@@ -565,14 +922,28 @@ class Evaluator:
         for sig in snapshot.log_signals:
             if sig.get("signal") == "unhealthy_deployments":
                 _escalate(Severity.WARNING)
-                findings.append(Finding(
-                    severity=Severity.WARNING,
-                    category=FindingCategory.OTHER,
-                    workload="cluster-level",
-                    what=f"{sig['count']} deployment(s) with 0 ready replicas",
-                    evidence=json.dumps(sig.get("sample", [])[:3]),
-                    suggested_action="Check deployment rollout status and pod events",
-                ))
+                for dep in sig.get("sample", [])[:5]:
+                    ns = dep.get("namespace", "")
+                    name = dep.get("name", "")
+                    desired = dep.get("desired", 0)
+                    findings.append(Finding(
+                        severity=Severity.WARNING,
+                        category=FindingCategory.UNHEALTHY_DEPLOYMENT,
+                        workload=f"{ns}/{name}",
+                        what=f"Deployment has desired={desired} but ready=0, available=0",
+                        evidence=json.dumps(dep),
+                        suggested_action="Check pod events and logs — may be CrashLoopBackOff or stuck Pending",
+                    ))
+                remaining = sig.get("count", 0) - min(sig.get("count", 0), 5)
+                if remaining > 0:
+                    findings.append(Finding(
+                        severity=Severity.INFO,
+                        category=FindingCategory.UNHEALTHY_DEPLOYMENT,
+                        workload="cluster-level",
+                        what=f"+{remaining} more unhealthy deployment(s)",
+                        evidence=json.dumps(sig.get("sample", [])[5:8]),
+                        suggested_action="Review all unhealthy deployments in console",
+                    ))
 
         metrics = EvaluationMetrics(
             total_pods=snapshot.total_pods,
@@ -610,7 +981,9 @@ class Evaluator:
             "total_pods": snapshot.total_pods,
             "running_pods": snapshot.running_pods,
             "pending_pods": snapshot.pending_pods,
+            "pending_pods_detail": snapshot.pending_pods_detail[:10],
             "crashloop_pods": snapshot.crashloop_pods,
+            "crashloop_pods_detail": snapshot.crashloop_pods_detail[:10],
             "oomkilled_pods": snapshot.oomkilled_pods[:10],
             # Node health (summary, not full list)
             "node_count": snapshot.node_count,
@@ -625,6 +998,10 @@ class Evaluator:
             ],
             # WOOP findings (pre-computed, not raw workloads)
             "woop_workload_count": len(snapshot.woop_workloads),
+            "woop_management": next(
+                (s for s in snapshot.log_signals if s.get("signal") == "woop_management_summary"),
+                {},
+            ),
             "recommendation_mismatches": snapshot.recommendation_mismatches[:10],
             "absurd_recommendations": snapshot.absurd_recommendations[:10],
             "data_gaps": snapshot.data_gaps[:10],

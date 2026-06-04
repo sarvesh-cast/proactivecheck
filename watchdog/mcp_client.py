@@ -20,12 +20,16 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+# Transient HTTP status codes worth retrying
+_RETRYABLE_STATUS = {502, 503, 504, 429}
 
 logger = logging.getLogger("watchdog.mcp_client")
 
@@ -269,16 +273,18 @@ class MCPClient:
         )
         return objects[-1] if isinstance(objects[-1], dict) else {"result": objects[-1]}
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        max_retries: int = 3,
+    ) -> Any:
         """Call an MCP tool and return the result content.
 
         Returns the parsed result on success, or None on failure.
-        Handles both JSON responses and SSE streams.
-        Automatically injects organization_id if set and not already present.
+        Retries transient errors (502/503/504/429/timeouts) with exponential backoff.
         """
         # Auto-inject organization_id for tools that accept it.
-        # Some tools (analyze_snapshot_with_code, get_cluster_snapshot_summary,
-        # extract_fields_from_all) reject it — skip those.
         _NO_ORG_ID_TOOLS = {
             "analyze_snapshot_with_code",
             "get_cluster_snapshot_summary",
@@ -290,69 +296,104 @@ class MCPClient:
                 and tool_name not in _NO_ORG_ID_TOOLS):
             arguments = {**arguments, "organization_id": self.organization_id}
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments,
-            },
-            "id": self._next_id(),
-        }
+        last_error: Exception | None = None
 
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(
-                    self.mcp_url,
-                    headers=self._build_headers(),
-                    json=payload,
-                )
-                resp.raise_for_status()
+        for attempt in range(1, max_retries + 1):
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments,
+                },
+                "id": self._next_id(),
+            }
 
-                content_type = resp.headers.get("content-type", "")
-                body_preview = resp.text[:500].replace("\n", "\\n")
-                logger.debug(
-                    "MCP tool %s → %d %s | body[:%d]: %s",
-                    tool_name, resp.status_code, content_type,
-                    min(500, len(resp.text)), body_preview,
-                )
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.post(
+                        self.mcp_url,
+                        headers=self._build_headers(),
+                        json=payload,
+                    )
 
-                # Handle SSE response (streaming)
-                if "text/event-stream" in content_type:
-                    extracted = self._parse_sse_response(resp.text)
+                    # Retry on transient HTTP errors
+                    if resp.status_code in _RETRYABLE_STATUS:
+                        wait = 2 ** attempt  # 2, 4, 8 seconds
+                        logger.warning(
+                            "MCP %s → %d (attempt %d/%d), retrying in %ds",
+                            tool_name, resp.status_code, attempt, max_retries, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+
+                    resp.raise_for_status()
+
+                    content_type = resp.headers.get("content-type", "")
+                    body_preview = resp.text[:500].replace("\n", "\\n")
                     logger.debug(
-                        "MCP %s SSE → type=%s",
+                        "MCP tool %s → %d %s | body[:%d]: %s",
+                        tool_name, resp.status_code, content_type,
+                        min(500, len(resp.text)), body_preview,
+                    )
+
+                    # Handle SSE response (streaming)
+                    if "text/event-stream" in content_type:
+                        extracted = self._parse_sse_response(resp.text)
+                        logger.debug(
+                            "MCP %s SSE → type=%s",
+                            tool_name, type(extracted).__name__,
+                        )
+                        return extracted
+
+                    # Handle direct JSON response
+                    body = resp.text.strip()
+                    if not body:
+                        logger.warning("MCP tool %s returned empty body", tool_name)
+                        return None
+
+                    result = self._parse_jsonrpc_body(body, tool_name)
+                    if isinstance(result, dict) and "error" in result:
+                        logger.error(
+                            "MCP tool %s error: %s",
+                            tool_name, result["error"],
+                        )
+                        return None
+
+                    extracted = self._extract_content(result)
+                    logger.debug(
+                        "MCP %s JSON → type=%s",
                         tool_name, type(extracted).__name__,
                     )
                     return extracted
 
-                # Handle direct JSON response
-                body = resp.text.strip()
-                if not body:
-                    logger.warning("MCP tool %s returned empty body", tool_name)
-                    return None
-
-                result = self._parse_jsonrpc_body(body, tool_name)
-                if isinstance(result, dict) and "error" in result:
-                    logger.error(
-                        "MCP tool %s error: %s",
-                        tool_name, result["error"],
+            except httpx.TimeoutException:
+                last_error = Exception(f"timeout after {self.timeout}s")
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "MCP %s timed out (attempt %d/%d), retrying in %ds",
+                        tool_name, attempt, max_retries, wait,
                     )
-                    return None
+                    await asyncio.sleep(wait)
+                    continue
+            except httpx.HTTPStatusError as e:
+                # Non-retryable HTTP error (4xx etc)
+                logger.error("MCP tool %s failed: HTTP %d", tool_name, e.response.status_code)
+                return None
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "MCP %s failed (attempt %d/%d): %s, retrying in %ds",
+                        tool_name, attempt, max_retries, e, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
 
-                extracted = self._extract_content(result)
-                logger.debug(
-                    "MCP %s JSON → type=%s",
-                    tool_name, type(extracted).__name__,
-                )
-                return extracted
-
-        except httpx.TimeoutException:
-            logger.error("MCP tool %s timed out after %ds", tool_name, self.timeout)
-            return None
-        except Exception as e:
-            logger.error("MCP tool %s failed: %s", tool_name, e)
-            return None
+        logger.error("MCP tool %s failed after %d attempts: %s", tool_name, max_retries, last_error)
+        return None
 
     def _extract_content(self, result: dict) -> Any:
         """Extract tool result content from JSON-RPC response."""

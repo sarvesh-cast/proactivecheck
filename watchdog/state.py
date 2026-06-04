@@ -40,6 +40,10 @@ class StateManager:
             # Basic shape validation
             if not isinstance(data, dict) or "snapshots" not in data:
                 raise ValueError("Invalid state shape")
+            # Backfill keys added after initial release
+            data.setdefault("dedup_log", {})
+            data.setdefault("data_gap_first_seen", {})
+            data.setdefault("pending_pod_first_seen", {})
             return data
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.warning("State file corrupted (%s), resetting: %s", self.state_file, e)
@@ -50,6 +54,7 @@ class StateManager:
             "snapshots": [],
             "dedup_log": {},  # {dedup_key_str: last_posted_iso}
             "data_gap_first_seen": {},  # {"ns/workload": iso_timestamp}
+            "pending_pod_first_seen": {},  # {"ns/pod_name": iso_timestamp}
         }
 
     def save(self) -> None:
@@ -214,6 +219,63 @@ class StateManager:
         if avg == 0:
             return 0.0
         return ((current - avg) / avg) * 100
+
+    # ── Pending pod age tracking ────────────────────────────────────
+
+    def update_pending_pods(self, pending_details: list[dict]) -> None:
+        """Track how long each pod has been in Pending state.
+
+        Maintains {ns/pod_name: first_seen_iso}. Pods no longer
+        Pending are removed (resolved).
+        """
+        tracker = self._state.setdefault("pending_pod_first_seen", {})
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        current_keys = set()
+        for p in pending_details:
+            key = f"{p.get('namespace', '')}/{p.get('name', '')}"
+            current_keys.add(key)
+            if key not in tracker:
+                tracker[key] = now_iso
+
+        # Remove resolved (no longer Pending)
+        resolved = [k for k in tracker if k not in current_keys]
+        for k in resolved:
+            del tracker[k]
+
+    def get_mature_pending_pods(self, min_minutes: float = 15.0) -> list[dict]:
+        """Return Pending pods that have been Pending for >= min_minutes.
+
+        Each entry gets 'age_minutes' and 'first_seen' fields.
+        """
+        tracker = self._state.get("pending_pod_first_seen", {})
+        now = datetime.now(timezone.utc)
+
+        # Get current pending from latest snapshot
+        snaps = self._state["snapshots"]
+        if not snaps:
+            return []
+        latest = snaps[-1]
+        current_pending = latest.get("pending_pods_detail", [])
+
+        mature = []
+        for p in current_pending:
+            key = f"{p.get('namespace', '')}/{p.get('name', '')}"
+            first_seen = tracker.get(key)
+            if not first_seen:
+                continue
+            try:
+                first_time = datetime.fromisoformat(first_seen)
+                age_min = (now - first_time).total_seconds() / 60
+                if age_min >= min_minutes:
+                    mature.append({
+                        **p,
+                        "age_minutes": round(age_min, 1),
+                        "first_seen": first_seen,
+                    })
+            except (ValueError, TypeError):
+                continue
+        return mature
 
     # ── Data gap duration tracking ────────────────────────────────────
 

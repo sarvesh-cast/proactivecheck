@@ -2,21 +2,61 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+
+def _load_dotenv() -> None:
+    """Load .env file from watchdog/ dir or repo root into os.environ (won't override existing vars)."""
+    for candidate in [Path(__file__).parent / ".env", Path.cwd() / ".env"]:
+        if candidate.exists():
+            for line in candidate.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if not os.environ.get(key):  # don't override existing
+                    os.environ[key] = value
+            break  # only load the first .env found
+
+
+_load_dotenv()
+
+
+def _load_castai_credential(env_var: str, file_path: str, json_key: str) -> str:
+    """Load a credential from env var first, then fall back to ~/.castai/ file."""
+    val = os.getenv(env_var, "")
+    if val:
+        return val
+    p = Path.home() / ".castai" / file_path
+    if p.exists():
+        try:
+            data = json.loads(p.read_text())
+            return data.get(json_key, "")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return ""
 
 
 @dataclass(frozen=True)
 class CastAIConfig:
-    """CAST AI API connection settings."""
+    """CAST AI API connection settings.
 
-    api_url: str = os.getenv("CASTAI_API_URL", "https://api.cast.ai")
-    api_key: str = os.getenv("CASTAI_API_KEY", "")
-    jwt_token: str = os.getenv("CASTAI_JWT_TOKEN", "")
-    organization_id: str = os.getenv("CASTAI_ORG_ID", "")
-    iap_token: str = os.getenv("CASTAI_IAP_TOKEN", "")
-    mcp_url: str = os.getenv("CASTAI_MCP_URL", "")  # e.g. https://castai-mcp.prod-master.cast.ai/mcp
+    JWT and IAP tokens are auto-loaded from ~/.castai/ if env vars are not set:
+      - ~/.castai/credentials.json  → "token" field → CASTAI_JWT_TOKEN
+      - ~/.castai/iap_token.json    → "token" field → CASTAI_IAP_TOKEN
+    """
+
+    api_url: str = field(default_factory=lambda: os.getenv("CASTAI_API_URL", "https://api.cast.ai"))
+    api_key: str = field(default_factory=lambda: os.getenv("CASTAI_API_KEY", ""))
+    jwt_token: str = field(default_factory=lambda: _load_castai_credential("CASTAI_JWT_TOKEN", "credentials.json", "token"))
+    organization_id: str = field(default_factory=lambda: os.getenv("CASTAI_ORG_ID", ""))
+    iap_token: str = field(default_factory=lambda: _load_castai_credential("CASTAI_IAP_TOKEN", "iap_token.json", "cookie_value"))
+    mcp_url: str = field(default_factory=lambda: os.getenv("CASTAI_MCP_URL", ""))
     request_timeout: int = 30  # seconds per API call
 
     @property
@@ -29,12 +69,18 @@ class CastAIConfig:
 
 
 @dataclass(frozen=True)
-class AnthropicConfig:
-    """Anthropic API settings for the evaluator."""
+class LLMConfig:
+    """LLM API settings for the evaluator.
 
-    api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
-    model: str = os.getenv("WATCHDOG_MODEL", "claude-haiku-4-5")
-    fallback_model: str = "claude-sonnet-4-5"
+    Supports any OpenAI-compatible endpoint via LLM_BASE_URL.
+    Default: CAST AI internal LLM proxy (https://llm.kimchi.dev/openai/v1).
+    Auth: uses CASTAI_API_KEY by default, or LLM_API_KEY if set.
+    """
+
+    api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "") or os.getenv("CASTAI_API_KEY", ""))
+    base_url: str = field(default_factory=lambda: os.getenv("LLM_BASE_URL", "https://llm.kimchi.dev/openai/v1"))
+    model: str = field(default_factory=lambda: os.getenv("WATCHDOG_MODEL", "minimax-m2.7"))
+    fallback_model: str = field(default_factory=lambda: os.getenv("WATCHDOG_FALLBACK_MODEL", "minimax-m2.7"))
     max_tokens: int = 4096
     temperature: float = 0.0  # deterministic for consistency
 
@@ -43,8 +89,8 @@ class AnthropicConfig:
 class SlackConfig:
     """Slack notification settings."""
 
-    webhook_url: str = os.getenv("SLACK_WEBHOOK_URL", "")
-    channel: str = os.getenv("SLACK_CHANNEL", "#castai_grip_security_ext")
+    webhook_url: str = field(default_factory=lambda: os.getenv("SLACK_WEBHOOK_URL", ""))
+    channel: str = field(default_factory=lambda: os.getenv("SLACK_CHANNEL", "#castai_grip_security_ext"))
     dedup_window_minutes: int = 30
     daily_summary_hour_utc: int = 8
 
@@ -57,9 +103,15 @@ class ClusterContext:
     Must be tuned during the 24-hour dry-run period.
     """
 
-    cluster_id: str = os.getenv(
-        "WATCHDOG_CLUSTER_ID", "e9f502e2-46dd-49fb-9310-149d7d8ad0ba"
-    )
+    cluster_id: str = field(default_factory=lambda: os.getenv(
+        "WATCHDOG_CLUSTER_ID", ""
+    ))
+    # Comma-separated list of cluster IDs for multi-cluster mode.
+    # If set, overrides cluster_id. Use "auto" to discover all clusters from org.
+    cluster_ids: list[str] = field(default_factory=lambda: [
+        cid.strip() for cid in os.getenv("WATCHDOG_CLUSTER_IDS", "").split(",")
+        if cid.strip()
+    ])
     cluster_name: str = "Grip Security prod-us-4"
     namespaces: list[str] = field(
         default_factory=lambda: [
@@ -109,13 +161,13 @@ class WatchdogConfig:
     """Top-level configuration combining all sub-configs."""
 
     castai: CastAIConfig = field(default_factory=CastAIConfig)
-    anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
     cluster: ClusterContext = field(default_factory=ClusterContext)
     thresholds: Thresholds = field(default_factory=Thresholds)
 
     run_interval_seconds: int = 300  # 5 minutes
     rolling_window_size: int = 12  # 12 snapshots = 1 hour
-    state_file: str = os.getenv("WATCHDOG_STATE_FILE", "watchdog_state.json")
-    dry_run: bool = os.getenv("WATCHDOG_DRY_RUN", "false").lower() == "true"
-    log_level: str = os.getenv("WATCHDOG_LOG_LEVEL", "INFO")
+    state_file: str = field(default_factory=lambda: os.getenv("WATCHDOG_STATE_FILE", "watchdog_state.json"))
+    dry_run: bool = field(default_factory=lambda: os.getenv("WATCHDOG_DRY_RUN", "false").lower() == "true")
+    log_level: str = field(default_factory=lambda: os.getenv("WATCHDOG_LOG_LEVEL", "INFO"))

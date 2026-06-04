@@ -28,6 +28,7 @@ class FindingCategory(str, Enum):
     AGENT_RESTART = "agent_restart"
     WEBHOOK_FAILURE = "webhook_failure"
     CASCADING_SCALING = "cascading_scaling"
+    UNHEALTHY_DEPLOYMENT = "unhealthy_deployment"
     CONFIG = "config"
     OTHER = "other"
 
@@ -51,7 +52,11 @@ class SnapshotData:
     total_pods: int = 0
     running_pods: int = 0
     pending_pods: int = 0
+    pending_pods_detail: list[dict] = field(default_factory=list)
+    # [{namespace, name, reason}]
     crashloop_pods: int = 0
+    crashloop_pods_detail: list[dict] = field(default_factory=list)
+    # [{namespace, name, container, restart_count}]
     oomkilled_pods: list[dict] = field(default_factory=list)
     # [{namespace, name, restart_count, container, last_oomkill_time}]
 
@@ -98,7 +103,8 @@ class SnapshotData:
         errors = d.get("collection_errors", [])
         d["collection_errors"] = [f"({len(errors)} errors)"] if errors else []
         # Cap list sizes for safety
-        for key in ("oomkilled_pods", "recommendation_mismatches",
+        for key in ("oomkilled_pods", "pending_pods_detail",
+                     "crashloop_pods_detail", "recommendation_mismatches",
                      "absurd_recommendations", "data_gaps",
                      "workload_memory_usage", "log_signals"):
             if key in d and len(d[key]) > 30:

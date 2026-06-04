@@ -35,13 +35,14 @@ Usage:
 Environment variables:
     CASTAI_API_KEY or CASTAI_JWT_TOKEN  — CAST AI authentication
     CASTAI_ORG_ID                       — Organization ID
-    ANTHROPIC_API_KEY                   — Anthropic API key for evaluation
+    LLM_API_KEY                         — LLM API key (falls back to CASTAI_API_KEY)
+    LLM_BASE_URL                        — OpenAI-compatible endpoint (default: https://llm.kimchi.dev/openai/v1)
     SLACK_WEBHOOK_URL                   — Slack incoming webhook
     WATCHDOG_CLUSTER_ID                 — Target cluster ID
     WATCHDOG_DRY_RUN=true               — Evaluate but don't post
     WATCHDOG_STATE_FILE                 — Path to state file
     WATCHDOG_LOG_LEVEL                  — Logging level (DEBUG/INFO/WARNING)
-    WATCHDOG_MODEL                      — Anthropic model (default: claude-haiku-4-5)
+    WATCHDOG_MODEL                      — LLM model (default: kimi-k2.6)
 """
 
 from __future__ import annotations
@@ -64,6 +65,115 @@ from .notifier import Notifier
 from .state import StateManager
 
 logger = logging.getLogger("watchdog")
+
+
+async def _resolve_cluster_ids(config: WatchdogConfig) -> list[dict]:
+    """Resolve the list of cluster IDs to monitor.
+
+    Returns list of {"id": ..., "name": ...} dicts.
+
+    Priority:
+      1. WATCHDOG_CLUSTER_IDS env var (comma-separated, or "auto")
+      2. WATCHDOG_CLUSTER_ID (single cluster, default)
+
+    "auto" discovers all clusters from the org via list_clusters MCP call.
+    """
+    # Explicit comma-separated list takes priority
+    ids = config.cluster.cluster_ids
+    if ids:
+        return [{"id": cid, "name": ""} for cid in ids]
+
+    # Single cluster ID set — use it
+    if config.cluster.cluster_id:
+        return [{"id": config.cluster.cluster_id, "name": config.cluster.cluster_name}]
+
+    # Nothing set — auto-discover all clusters from org
+    logger.info("No cluster IDs configured, discovering from org...")
+    if not config.castai.mcp_url:
+        logger.error("Cannot auto-discover clusters: CASTAI_MCP_URL not set")
+        return []
+    from .mcp_client import MCPClient
+    mcp = MCPClient(
+        mcp_url=config.castai.mcp_url,
+        jwt_token=config.castai.jwt_token or None,
+        organization_id=config.castai.organization_id or None,
+    )
+    try:
+        await mcp.initialize()
+        call_args = {}
+        if config.castai.organization_id:
+            call_args["organization_id"] = config.castai.organization_id
+        data = await mcp.call_tool("list_clusters", call_args)
+        logger.debug("list_clusters raw response: type=%s repr=%.500s", type(data).__name__, repr(data))
+
+        if data is None:
+            logger.error("list_clusters returned None — MCP call may have failed silently")
+            return []
+
+        # Unwrap layers until we get to the items list
+        # The response can arrive in several shapes depending on the MCP transport path:
+        #   1. Already parsed dict: {"items": [...]}
+        #   2. JSON string: '{"items": [...]}'
+        #   3. Wrapped: {"result": '{"items": [...]}'}
+        #   4. Double-wrapped: '{"result": "{\"items\": [...]}"}'
+        #   5. Just a list: [{"id": ...}, ...]
+
+        # Step 1: parse string to dict/list
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                logger.error("list_clusters returned unparseable string: %.200s", data)
+                return []
+
+        # Step 2: unwrap {"result": ...} wrapper (may be nested)
+        for _ in range(3):  # max 3 unwrap attempts
+            if isinstance(data, dict) and "result" in data and len(data) <= 3:
+                inner = data["result"]
+                if isinstance(inner, str):
+                    try:
+                        data = json.loads(inner)
+                    except json.JSONDecodeError:
+                        break
+                else:
+                    data = inner
+            else:
+                break
+
+        # Step 3: extract items (MCP returns "clusters" key, API returns "items")
+        if isinstance(data, dict):
+            clusters = data.get("clusters") or data.get("items") or []
+        elif isinstance(data, list):
+            clusters = data
+        else:
+            logger.error("list_clusters returned unexpected type after unwrap: %s", type(data).__name__)
+            return []
+
+        if not isinstance(clusters, list):
+            logger.error("Expected list of clusters, got %s", type(clusters).__name__)
+            return []
+
+        discovered = [
+            {"id": cl["id"], "name": cl.get("name", "")}
+            for cl in clusters
+            if isinstance(cl, dict) and cl.get("id")
+        ]
+        labels = [f"{c['name'] or '?'} ({c['id'][:8]})" for c in discovered]
+        logger.info("Auto-discovered %d clusters: %s", len(discovered), ", ".join(labels))
+        return discovered
+    except Exception as e:
+        logger.error("Cluster auto-discovery failed: %s", e, exc_info=True)
+    return []
+
+
+def _config_for_cluster(base_config: WatchdogConfig, cluster_id: str, cluster_name: str = "") -> WatchdogConfig:
+    """Create a per-cluster config clone with its own cluster_id, name, and state file."""
+    from dataclasses import replace
+    cluster = replace(base_config.cluster, cluster_id=cluster_id, cluster_name=cluster_name or cluster_id[:8])
+    # Per-cluster state file: watchdog_state_<first8chars>.json
+    base = base_config.state_file.replace(".json", "")
+    state_file = f"{base}_{cluster_id[:8]}.json" if len(cluster_id) > 8 else f"{base}_{cluster_id}.json"
+    return replace(base_config, cluster=cluster, state_file=state_file)
 
 
 class Watchdog:
@@ -104,8 +214,9 @@ class Watchdog:
         # Store snapshot in rolling window
         self.state.push_snapshot(snapshot.to_dict_compact())
 
-        # Track data gap durations (updates first_seen timestamps)
+        # Track durations (updates first_seen timestamps)
         self.state.update_data_gaps(snapshot.data_gaps)
+        self.state.update_pending_pods(snapshot.pending_pods_detail)
 
         # ── Phase 2: Evaluate ─────────────────────────────────────
         try:
@@ -115,6 +226,8 @@ class Watchdog:
             agent_restart_delta = self.state.compute_agent_restarts_last_hour()
             memory_leaks = self.state.detect_memory_leaks()
             mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0)
+            mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
+            oomkill_trend = self.state.get_oomkill_trend()
 
             result = await self.evaluator.evaluate(
                 snapshot, history, node_delta_pct,
@@ -122,6 +235,8 @@ class Watchdog:
                 agent_restarts_last_hour=agent_restart_delta,
                 memory_leaks=memory_leaks,
                 mature_data_gaps=mature_data_gaps,
+                mature_pending_pods=mature_pending,
+                oomkill_trend=oomkill_trend,
             )
             logger.info(
                 "Evaluation: verdict=%s, findings=%d, model=%s",
@@ -262,18 +377,25 @@ class Watchdog:
             })
             logger.info("Loaded latest snapshot from state (%s)", snapshot.timestamp)
 
+        # Ensure duration trackers are populated (needed for --evaluator-only with --fixture)
+        self.state.update_data_gaps(snapshot.data_gaps)
+        self.state.update_pending_pods(snapshot.pending_pods_detail)
+
         history = self.state.get_snapshots()
         node_delta = self.state.compute_node_count_delta_pct()
         pod_delta = self.state.compute_pod_count_delta_pct()
         agent_restart_delta = self.state.compute_agent_restarts_last_hour()
         memory_leaks = self.state.detect_memory_leaks()
         mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0)
+        mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
+        oomkill_trend = self.state.get_oomkill_trend()
 
         if raw_fallback:
             logger.info("Using raw-metrics fallback (no LLM call)")
             result = self.evaluator._raw_metrics_fallback(
                 snapshot, node_delta, pod_delta, agent_restart_delta,
-                memory_leaks, mature_data_gaps,
+                memory_leaks, mature_data_gaps, oomkill_trend,
+                mature_pending_pods=mature_pending,
             )
         else:
             result = await self.evaluator.evaluate(
@@ -282,6 +404,8 @@ class Watchdog:
                 agent_restarts_last_hour=agent_restart_delta,
                 memory_leaks=memory_leaks,
                 mature_data_gaps=mature_data_gaps,
+                mature_pending_pods=mature_pending,
+                oomkill_trend=oomkill_trend,
             )
 
         # Print structured result to stdout
@@ -371,20 +495,17 @@ def _validate_config(config: WatchdogConfig, mode: str) -> list[str]:
     errors = []
 
     needs_castai = mode in ("full", "collector-only")
-    needs_anthropic = mode in ("full", "evaluator-only")
+    needs_llm = mode in ("full", "evaluator-only")
     needs_slack = mode in ("full",) and not config.dry_run
 
     if needs_castai and not config.castai.api_key and not config.castai.jwt_token:
         errors.append("Missing CAST AI credentials: set CASTAI_API_KEY or CASTAI_JWT_TOKEN")
 
-    if needs_anthropic and not config.anthropic.api_key:
-        errors.append("Missing ANTHROPIC_API_KEY (not needed with --raw-fallback)")
+    if needs_llm and not config.llm.api_key:
+        errors.append("Missing LLM_API_KEY or CASTAI_API_KEY (not needed with --raw-fallback)")
 
     if needs_slack and not config.slack.webhook_url:
         errors.append("Missing SLACK_WEBHOOK_URL (set WATCHDOG_DRY_RUN=true to skip)")
-
-    if not config.cluster.cluster_id:
-        errors.append("Missing WATCHDOG_CLUSTER_ID")
 
     return errors
 
@@ -417,6 +538,94 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
+    """Resolve cluster IDs then run the pipeline for each cluster."""
+    clusters = await _resolve_cluster_ids(base_config)
+    if not clusters:
+        logger.error("No cluster IDs to monitor")
+        sys.exit(1)
+
+    is_multi = len(clusters) > 1
+    if is_multi:
+        logger.info("Multi-cluster mode: %d clusters", len(clusters))
+
+    for i, cl in enumerate(clusters):
+        cid, cname = cl["id"], cl["name"]
+        cfg = _config_for_cluster(base_config, cid, cname) if is_multi else base_config
+        if not is_multi and cname:
+            # Single cluster — still set the name from discovery
+            from dataclasses import replace as _replace
+            cfg = _replace(cfg, cluster=_replace(cfg.cluster, cluster_name=cname))
+        if args.skip_notify:
+            from dataclasses import replace as _replace
+            cfg = _replace(cfg, dry_run=True)
+
+        if is_multi:
+            logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
+
+        watchdog = Watchdog(cfg)
+
+        if args.state_dump:
+            watchdog.dump_state()
+        elif args.collector_only:
+            await watchdog.run_collector_only()
+        elif args.evaluator_only:
+            await watchdog.run_evaluator_only(
+                fixture_path=args.fixture,
+                raw_fallback=args.raw_fallback,
+            )
+        elif args.notifier_only:
+            await watchdog.run_notifier_only()
+        elif args.once:
+            await watchdog.run_once()
+        else:
+            # Continuous loop — run all clusters each cycle
+            await _run_multi_loop(base_config, clusters, args)
+            return  # loop handles its own exit
+
+
+async def _run_multi_loop(base_config: WatchdogConfig, clusters: list[dict], args) -> None:
+    """Continuous loop that processes all clusters each cycle."""
+    shutdown = False
+
+    def _handle_shutdown():
+        nonlocal shutdown
+        shutdown = True
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _handle_shutdown)
+
+    is_multi = len(clusters) > 1
+    logger.info(
+        "Watchdog starting | %d cluster(s) | interval=%ds | %s mode",
+        len(clusters),
+        base_config.run_interval_seconds,
+        "DRY-RUN" if base_config.dry_run else "LIVE",
+    )
+
+    while not shutdown:
+        for i, cl in enumerate(clusters):
+            if shutdown:
+                break
+            cid, cname = cl["id"], cl["name"]
+            cfg = _config_for_cluster(base_config, cid, cname) if is_multi else base_config
+            if is_multi:
+                logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
+            watchdog = Watchdog(cfg)
+            try:
+                await watchdog.run_once()
+            except Exception as e:
+                logger.error("Error on cluster %s: %s", cid, e, exc_info=True)
+
+        for _ in range(base_config.run_interval_seconds):
+            if shutdown:
+                break
+            await asyncio.sleep(1)
+
+    logger.info("Watchdog shutting down gracefully")
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
@@ -434,43 +643,15 @@ def main() -> None:
     else:
         mode = "full"
 
+    # Cluster IDs are resolved at runtime (explicit list, single ID, or auto-discovery)
+    # so skip the cluster_id check here — _resolve_cluster_ids handles it
     errors = _validate_config(config, mode)
     if errors:
         for err in errors:
             logger.error("Config error: %s", err)
         sys.exit(1)
 
-    watchdog = Watchdog(config)
-
-    # Override dry_run for --skip-notify
-    if args.skip_notify:
-        config = WatchdogConfig(
-            castai=config.castai, anthropic=config.anthropic,
-            slack=config.slack, cluster=config.cluster,
-            thresholds=config.thresholds,
-            run_interval_seconds=config.run_interval_seconds,
-            rolling_window_size=config.rolling_window_size,
-            state_file=config.state_file, dry_run=True,
-            log_level=config.log_level,
-        )
-        watchdog = Watchdog(config)
-
-    # Dispatch
-    if args.state_dump:
-        watchdog.dump_state()
-    elif args.collector_only:
-        asyncio.run(watchdog.run_collector_only())
-    elif args.evaluator_only:
-        asyncio.run(watchdog.run_evaluator_only(
-            fixture_path=args.fixture,
-            raw_fallback=args.raw_fallback,
-        ))
-    elif args.notifier_only:
-        asyncio.run(watchdog.run_notifier_only())
-    elif args.once:
-        asyncio.run(watchdog.run_once())
-    else:
-        asyncio.run(watchdog.run_loop())
+    asyncio.run(_run_multi_cluster(config, args))
 
 
 if __name__ == "__main__":

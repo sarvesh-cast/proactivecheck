@@ -55,13 +55,13 @@ watchdog/
 - Python 3.11+
 - CAST AI API credentials (JWT token or API key)
 - IAP token for MCP server access (`~/.castai/iap_token.json`)
-- Anthropic API key
+- LLM API key (CASTAI_API_KEY or LLM_API_KEY)
 - Slack incoming webhook URL
 
 ### Install dependencies
 
 ```bash
-pip install httpx anthropic
+pip install httpx openai
 ```
 
 ### Environment Variables
@@ -73,10 +73,11 @@ pip install httpx anthropic
 | `CASTAI_ORG_ID` | Yes | Organization UUID |
 | `CASTAI_MCP_URL` | Yes | MCP endpoint, e.g. `https://castai-mcp.prod-master.cast.ai/mcp` |
 | `CASTAI_IAP_TOKEN` | Yes | IAP cookie from `~/.castai/iap_token.json` |
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key for the evaluator |
+| `LLM_API_KEY` | No | LLM API key (falls back to `CASTAI_API_KEY`) |
+| `LLM_BASE_URL` | No | OpenAI-compatible endpoint (default: `https://llm.kimchi.dev/openai/v1`) |
 | `SLACK_WEBHOOK_URL` | Yes | Slack incoming webhook |
 | `WATCHDOG_CLUSTER_ID` | No | Target cluster UUID (default: Grip prod-us-4) |
-| `WATCHDOG_MODEL` | No | LLM model (default: `claude-haiku-4-5`) |
+| `WATCHDOG_MODEL` | No | LLM model (default: `kimi-k2.6`) |
 | `WATCHDOG_DRY_RUN` | No | `true` to evaluate without posting to Slack |
 | `WATCHDOG_STATE_FILE` | No | State file path (default: `watchdog_state.json`) |
 | `WATCHDOG_LOG_LEVEL` | No | `DEBUG` / `INFO` / `WARNING` |
