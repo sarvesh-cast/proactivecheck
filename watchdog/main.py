@@ -102,7 +102,7 @@ class Watchdog:
             return  # Can't evaluate without data
 
         # Store snapshot in rolling window
-        self.state.push_snapshot(snapshot.to_dict())
+        self.state.push_snapshot(snapshot.to_dict_compact())
 
         # Track data gap durations (updates first_seen timestamps)
         self.state.update_data_gaps(snapshot.data_gaps)
@@ -196,7 +196,7 @@ class Watchdog:
         """Run only the collector, print snapshot JSON to stdout."""
         logger.info("Running collector only against cluster %s", self.config.cluster.cluster_id)
         snapshot = await self.collector.collect()
-        self.state.push_snapshot(snapshot.to_dict())
+        self.state.push_snapshot(snapshot.to_dict_compact())
         self.state.save()
 
         print(snapshot.to_json())

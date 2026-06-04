@@ -83,6 +83,28 @@ class SnapshotData:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def to_dict_compact(self) -> dict:
+        """Compact dict for state storage — strips bulk fields.
+
+        Drops woop_workloads (can be 10M+ chars) and full node details.
+        Keeps only pre-computed findings and fields needed for trend detection.
+        """
+        d = asdict(self)
+        # Drop the mega-list; pre-computed findings are in separate fields
+        d.pop("woop_workloads", None)
+        # Keep node_count but drop per-node detail (nodes list)
+        d.pop("nodes", None)
+        # Trim collection_errors to just the count
+        errors = d.get("collection_errors", [])
+        d["collection_errors"] = [f"({len(errors)} errors)"] if errors else []
+        # Cap list sizes for safety
+        for key in ("oomkilled_pods", "recommendation_mismatches",
+                     "absurd_recommendations", "data_gaps",
+                     "workload_memory_usage", "log_signals"):
+            if key in d and len(d[key]) > 30:
+                d[key] = d[key][:30]
+        return d
+
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
