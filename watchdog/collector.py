@@ -8,10 +8,10 @@ MCP server which provides access to:
     - get_cluster_snapshot_summary  → node count, cluster metadata
 
   WOOP tools:
-    - woop_get_workloads            → recommendations vs applied values
+    - woop_analyze_with_code        → server-side detection (absurd, mismatch, gaps)
+    - woop_get_workload_metrics     → historical per-workload metrics (backtest)
     - woop_get_oom_summary          → OOM kills ranked by workload
     - woop_get_workload_resource_ratios → limit/request ratio checks
-    - woop_get_workload_events      → OOM_KILL, SURGE, STARTUP_FAILURE events
 
   Log tools (Grafana Loki-backed):
     - loki_query                    → evictor, WA mutation, safety logs
@@ -43,12 +43,13 @@ logger = logging.getLogger("watchdog.collector")
 class Collector:
     """Collects cluster state via MCP server (preferred) or public API."""
 
-    def __init__(self, config: WatchdogConfig) -> None:
+    def __init__(self, config: WatchdogConfig, snapshot_time: str | None = None) -> None:
         self.config = config
         self.api_url = config.castai.api_url.rstrip("/")
         self.timeout = config.castai.request_timeout
         self.cluster_id = config.cluster.cluster_id
         self.org_id = config.castai.organization_id
+        self.snapshot_time = snapshot_time  # ISO 8601 for historical backtest
         self.mcp = None
 
         if config.castai.mcp_url:
@@ -65,10 +66,14 @@ class Collector:
 
     async def collect(self) -> SnapshotData:
         """Run all collectors concurrently. MCP-first with retry, public API fallback."""
+        # Use snapshot_time for backtest mode, otherwise current UTC
+        ts = self.snapshot_time if self.snapshot_time else datetime.now(timezone.utc).isoformat()
         snapshot = SnapshotData(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=ts,
             cluster_id=self.cluster_id,
         )
+        if self.snapshot_time:
+            logger.info("BACKTEST MODE: collecting snapshot at %s", self.snapshot_time)
 
         # Try MCP path first, with session re-init on failure
         if self.mcp:
@@ -115,11 +120,23 @@ class Collector:
           5. get_cluster_details + get_cluster_snapshot_summary → metadata
           6. loki_query                  → mutation errors, evictor, webhooks
           7. list_clusters               → org-wide agent health check
+
+        In backtest mode (snapshot_time set), WOOP-based collectors swap to
+        historical event reconstruction since woop_get_workloads has no
+        snapshot_time parameter.
         """
+        # In backtest mode, use historical WOOP event reconstruction
+        if self.snapshot_time:
+            woop_fn = self._mcp_woop_backtest(snapshot)
+            oom_fn = self._mcp_oom_summary_backtest(snapshot)
+        else:
+            woop_fn = self._mcp_woop_workloads(snapshot)
+            oom_fn = self._mcp_oom_summary(snapshot)
+
         results = await asyncio.gather(
             self._mcp_snapshot_health(snapshot),
-            self._mcp_woop_workloads(snapshot),
-            self._mcp_oom_summary(snapshot),
+            woop_fn,
+            oom_fn,
             self._mcp_resource_ratios(snapshot),
             self._mcp_cluster_details(snapshot),
             self._mcp_loki_signals(snapshot),
@@ -338,6 +355,7 @@ result = {
             await self.mcp.analyze_snapshot(
                 self.cluster_id, code,
                 "Pod health, node capacity, deployment health, agent status",
+                snapshot_time=self.snapshot_time,
             )
         )
 
@@ -352,7 +370,12 @@ result = {
 
         # Filter OOMKills: only keep those from the last hour.
         # lastState.terminated.finishedAt can be days old; we need recency.
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        # In backtest mode, use snapshot_time as reference instead of now.
+        if self.snapshot_time:
+            ref_time = datetime.fromisoformat(self.snapshot_time.replace("Z", "+00:00"))
+        else:
+            ref_time = datetime.now(timezone.utc)
+        cutoff = (ref_time - timedelta(hours=1)).isoformat()
         raw_oom = data.get("oomkilled", [])
         recent_oom = []
         for o in raw_oom:
@@ -398,206 +421,254 @@ result = {
         )
 
     async def _mcp_woop_workloads(self, snapshot: SnapshotData) -> None:
-        """woop_get_workloads: recommendation vs applied, mismatches, absurd recs."""
-        data = await self.mcp.call_tool("woop_get_workloads", {
+        """woop_analyze_with_code: run all WOOP detection server-side in one call.
+
+        Instead of fetching all workloads over the wire and iterating locally,
+        we send Python code to the server that scans all workloads and returns
+        only the findings (mismatches, absurd, data_gaps, summary).
+        """
+        t = self.config.thresholds
+        known_s2z = self.config.cluster.known_scale_to_zero_workloads
+        # Serialize thresholds and config into the code string
+        known_s2z_json = json.dumps(known_s2z)
+
+        analysis_code = f'''
+ABSURD_MEM_GIB = {t.absurd_memory_gib}
+ABSURD_CPU_CORES = {t.absurd_cpu_cores}
+MISMATCH_PCT = {t.recommendation_mismatch_pct}
+MISMATCH_MIN_MEM_GIB = {t.mismatch_min_memory_gib}
+MISMATCH_MIN_CPU_CORES = {t.mismatch_min_cpu_cores}
+OUTLIER_RATIO = {t.outlier_median_ratio}
+KNOWN_S2Z = {known_s2z_json}
+
+workloads = get_workloads()
+
+mismatches = []
+absurd = []
+data_gaps = []
+summary = {{"managed": 0, "read_only": 0, "undefined": 0, "total": len(workloads)}}
+
+for wl in workloads:
+    wl_name = wl.get("name", "unknown")
+    wl_ns = wl.get("namespace", "unknown")
+    wl_key = wl_ns + "/" + wl_name
+
+    wl_config = wl.get("workloadConfigV2") or {{}}
+    vpa_cfg = wl_config.get("vpaConfig") or {{}}
+    mem_limit_cfg = vpa_cfg.get("memory") or {{}}
+    mem_limit_sub = mem_limit_cfg.get("limit") or {{}}
+    mem_limit_mult = mem_limit_sub.get("multiplier", 0) or 0
+
+    mgmt = vpa_cfg.get("managementOption", "UNDEFINED")
+    apply_type = vpa_cfg.get("applyType", "")
+
+    woop_tag = mgmt
+    if apply_type:
+        woop_tag = woop_tag + "/" + apply_type
+
+    if mgmt == "MANAGED":
+        summary["managed"] += 1
+    elif mgmt == "READ_ONLY":
+        summary["read_only"] += 1
+    else:
+        summary["undefined"] += 1
+
+    skip = False
+    for pat in KNOWN_S2Z:
+        if pat in wl_name:
+            skip = True
+            break
+    if skip:
+        continue
+
+    containers = wl.get("containers") or []
+
+    has_rec = False
+    for ctr in containers:
+        if ctr.get("recommendation"):
+            has_rec = True
+            break
+
+    pod_count = wl.get("podCount", 0) or 0
+
+    if mgmt == "MANAGED" and not has_rec:
+        if pod_count > 0:
+            data_gaps.append({{"workload": wl_key, "woop": woop_tag,
+                              "reason": "MANAGED but no active recommendation"}})
+        continue
+
+    # Only flag MANAGED workloads for mismatch/absurd — READ_ONLY are informational
+    if mgmt != "MANAGED":
+        continue
+
+    if not has_rec or not containers:
+        continue
+
+    for ctr in containers:
+        c_name = ctr.get("containerName", ctr.get("name", ""))
+        res = ctr.get("resources") or {{}}
+        ar = res.get("requests") or {{}}
+        al = res.get("limits") or {{}}
+        act_mem_gib = ar.get("memoryGib", 0) or 0
+        act_cpu_cores = ar.get("cpuCores", 0) or 0
+        act_lim_mem_gib = al.get("memoryGib", 0) or 0
+
+        rec_data = ctr.get("recommendation") or {{}}
+        rr = rec_data.get("requests") or {{}}
+        rec_mem_gib = rr.get("memoryGib", 0) or 0
+        rec_cpu_cores = rr.get("cpuCores", 0) or 0
+
+        # Helper to format GiB/MiB
+        def fmt_mem(gib):
+            if gib >= 1.0:
+                return str(round(gib, 1)) + " GiB"
+            return str(round(gib * 1024, 1)) + " MiB"
+
+        # Absurd — recommendation exceeds cap
+        if rec_mem_gib > ABSURD_MEM_GIB:
+            absurd.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                           "sub_type": "cap_breach",
+                           "recommended_memory_gib": round(rec_mem_gib, 1),
+                           "applied_memory_gib": round(act_mem_gib, 1),
+                           "rec_display": fmt_mem(rec_mem_gib),
+                           "applied_display": fmt_mem(act_mem_gib),
+                           "reason": "WOOP recommends " + fmt_mem(rec_mem_gib)}})
+        if rec_cpu_cores > ABSURD_CPU_CORES:
+            absurd.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                           "sub_type": "cap_breach",
+                           "recommended_cpu_cores": round(rec_cpu_cores, 1),
+                           "applied_cpu_cores": round(act_cpu_cores, 1),
+                           "rec_display": str(round(rec_cpu_cores, 1)) + " CPU",
+                           "applied_display": str(round(act_cpu_cores, 1)) + " CPU",
+                           "reason": "WOOP recommends " + str(round(rec_cpu_cores)) + " CPU cores"}})
+
+        # Absurd — applied exceeds cap
+        if act_mem_gib > ABSURD_MEM_GIB:
+            absurd.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                           "sub_type": "cap_breach",
+                           "applied_memory_gib": round(act_mem_gib, 1),
+                           "recommended_memory_gib": round(rec_mem_gib, 1),
+                           "rec_display": fmt_mem(rec_mem_gib),
+                           "applied_display": fmt_mem(act_mem_gib),
+                           "reason": "Applied " + fmt_mem(act_mem_gib) + " (rec " + fmt_mem(rec_mem_gib) + ")"}})
+        if act_cpu_cores > ABSURD_CPU_CORES:
+            absurd.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                           "sub_type": "cap_breach",
+                           "applied_cpu_cores": round(act_cpu_cores, 1),
+                           "recommended_cpu_cores": round(rec_cpu_cores, 1),
+                           "rec_display": str(round(rec_cpu_cores, 1)) + " CPU",
+                           "applied_display": str(round(act_cpu_cores, 1)) + " CPU",
+                           "reason": "Applied " + str(round(act_cpu_cores)) + " cores (rec " + str(round(rec_cpu_cores, 1)) + ")"}})
+
+        # Ratio breach — recommendation >= 10x current request
+        if act_mem_gib > 0 and rec_mem_gib >= act_mem_gib * OUTLIER_RATIO:
+            rec_ratio = round(rec_mem_gib / act_mem_gib, 1)
+            absurd.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                           "sub_type": "ratio_breach",
+                           "recommended_memory_gib": round(rec_mem_gib, 1),
+                           "applied_memory_gib": round(act_mem_gib, 1),
+                           "rec_display": fmt_mem(rec_mem_gib),
+                           "applied_display": fmt_mem(act_mem_gib),
+                           "limit_request_ratio": rec_ratio,
+                           "reason": "Rec " + fmt_mem(rec_mem_gib) + " is " + str(rec_ratio) + "x the current request " + fmt_mem(act_mem_gib)}})
+
+        # Mismatch — rec vs applied divergence (requires both % AND absolute delta)
+        if act_mem_gib and rec_mem_gib:
+            pct = abs(rec_mem_gib - act_mem_gib) / rec_mem_gib * 100
+            abs_delta = abs(rec_mem_gib - act_mem_gib)
+            if pct > MISMATCH_PCT and abs_delta >= MISMATCH_MIN_MEM_GIB:
+                mismatches.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                                   "recommended_memory_gib": round(rec_mem_gib, 1),
+                                   "actual_memory_gib": round(act_mem_gib, 1),
+                                   "rec_display": fmt_mem(rec_mem_gib),
+                                   "applied_display": fmt_mem(act_mem_gib),
+                                   "diff_pct": round(pct, 1)}})
+        if act_cpu_cores and rec_cpu_cores:
+            pct = abs(rec_cpu_cores - act_cpu_cores) / rec_cpu_cores * 100
+            abs_delta = abs(rec_cpu_cores - act_cpu_cores)
+            if pct > MISMATCH_PCT and abs_delta >= MISMATCH_MIN_CPU_CORES:
+                mismatches.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                                   "recommended_cpu_cores": round(rec_cpu_cores, 1),
+                                   "actual_cpu_cores": round(act_cpu_cores, 1),
+                                   "rec_display": str(round(rec_cpu_cores, 2)) + " CPU",
+                                   "applied_display": str(round(act_cpu_cores, 2)) + " CPU",
+                                   "diff_pct": round(pct, 1)}})
+
+result = {{
+    "mismatches": mismatches,
+    "absurd": absurd,
+    "data_gaps": data_gaps,
+    "summary": summary,
+}}
+'''
+
+        woop_args = {
             "cluster_id_or_name": self.cluster_id,
-            "auto_paginate": True,
-            "include_recommendations": True,
-            "include_containers": True,
-        })
+            "analysis_code": analysis_code,
+            "description": "WOOP watchdog: detect absurd recs, mismatches, data gaps, broken multipliers",
+            "timeout": 45,
+        }
+        if self.org_id:
+            woop_args["organization_id"] = self.org_id
+
+        data = await self.mcp.call_tool("woop_analyze_with_code", woop_args)
         if not data:
-            raise RuntimeError("woop_get_workloads returned empty")
+            raise RuntimeError("woop_analyze_with_code returned empty")
         if isinstance(data, str):
             data = json.loads(data)
 
-        workloads = data.get("workloads", data) if isinstance(data, dict) else data
-        if not isinstance(workloads, list):
-            workloads = []
+        # Handle the server response envelope
+        if isinstance(data, dict) and "error" in data and "error_type" in data:
+            raise RuntimeError(
+                f"woop_analyze_with_code error: {data['error']} "
+                f"(hint: {data.get('hint', 'none')})"
+            )
+        if isinstance(data, dict) and "result" in data and data.get("success"):
+            data = data["result"]
 
-        mismatches = []
-        absurd = []
-        data_gaps = []
-        woop_summary = {"managed": 0, "read_only": 0, "undefined": 0}
-        t = self.config.thresholds
-        known_s2z = self.config.cluster.known_scale_to_zero_workloads
+        mismatches = data.get("mismatches", [])
+        absurd = data.get("absurd", [])
+        data_gaps = data.get("data_gaps", [])
+        woop_summary = data.get("summary", {})
 
-        for wl in workloads:
-            wl_name = wl.get("workloadName", wl.get("name", "unknown"))
-            wl_ns = wl.get("workloadNamespace", wl.get("namespace", "unknown"))
-            wl_key = f"{wl_ns}/{wl_name}"
-
-            # Extract WOOP config from the correct nested path
-            wl_config = wl.get("workloadConfigV2", {})
-            vpa_cfg = wl_config.get("vpaConfig", {})
-            hpa_cfg = wl_config.get("hpaConfig", {})
-            rollout = wl_config.get("rolloutBehavior", {})
-
-            mgmt = vpa_cfg.get("managementOption", "UNDEFINED")
-            apply_type = vpa_cfg.get("applyType", "")
-            downscale_apply = vpa_cfg.get("downscaling", {}).get("applyType", "")
-            mem_event_apply = vpa_cfg.get("memoryEvent", {}).get("applyType", "")
-            hpa_mgmt = hpa_cfg.get("managementOption", "")
-            mem_limit_type = vpa_cfg.get("memory", {}).get("limit", {}).get("type", "")
-            mem_limit_mult = vpa_cfg.get("memory", {}).get("limit", {}).get("multiplier", 0)
-            rollout_type = rollout.get("type", "")
-
-            # WOOP config tag for findings
-            woop_tag = f"{mgmt}"
-            if apply_type:
-                woop_tag += f"/{apply_type}"
-
-            # Track management stats
-            if mgmt == "MANAGED":
-                woop_summary["managed"] += 1
-            elif mgmt == "READ_ONLY":
-                woop_summary["read_only"] += 1
-            else:
-                woop_summary["undefined"] += 1
-
-            if any(pat in wl_name for pat in known_s2z):
-                continue
-
-            rec = wl.get("recommendation", {})
-            containers = wl.get("containers", [])
-
-            if mgmt == "MANAGED" and not rec:
-                data_gaps.append({
-                    "workload": wl_key,
-                    "woop": woop_tag,
-                    "reason": "MANAGED but no active recommendation",
-                })
-                continue
-
-            if not rec or not containers:
-                continue
-
-            rec_map = {
-                c.get("containerName"): c
-                for c in rec.get("containers", [])
-            }
-
-            for ctr in containers:
-                c_name = ctr.get("containerName", "")
-                rc = rec_map.get(c_name, {})
-                if not rc:
-                    continue
-
-                rr = rc.get("requests", {})
-                ar = ctr.get("requests", {})
-                rec_mem, act_mem = rr.get("memory", 0), ar.get("memory", 0)
-                rec_cpu, act_cpu = rr.get("cpu", 0), ar.get("cpu", 0)
-
-                # Absurd checks — on recommendation
-                rec_mem_gib = rec_mem / (1024**3) if rec_mem else 0
-                rec_cpu_cores = rec_cpu / 1000 if rec_cpu else 0
-
-                if rec_mem_gib > t.absurd_memory_gib:
-                    absurd.append({
-                        "workload": wl_key, "container": c_name,
-                        "woop": woop_tag,
-                        "recommended_memory_gib": round(rec_mem_gib, 1),
-                        "reason": f"WOOP recommends {rec_mem_gib:.0f} GiB memory",
-                    })
-                if rec_cpu_cores > t.absurd_cpu_cores:
-                    absurd.append({
-                        "workload": wl_key, "container": c_name,
-                        "woop": woop_tag,
-                        "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                        "reason": f"WOOP recommends {rec_cpu_cores:.0f} CPU cores",
-                    })
-
-                # Absurd checks — on applied (actual) values
-                act_mem_gib = act_mem / (1024**3) if act_mem else 0
-                act_cpu_cores = act_cpu / 1000 if act_cpu else 0
-
-                if act_mem_gib > t.absurd_memory_gib:
-                    absurd.append({
-                        "workload": wl_key, "container": c_name,
-                        "woop": woop_tag,
-                        "applied_memory_gib": round(act_mem_gib, 1),
-                        "recommended_memory_gib": round(rec_mem_gib, 1),
-                        "reason": f"Applied {act_mem_gib:.0f} GiB memory "
-                                  f"(WOOP recommends only {rec_mem_gib:.1f} GiB)",
-                    })
-                if act_cpu_cores > t.absurd_cpu_cores:
-                    absurd.append({
-                        "workload": wl_key, "container": c_name,
-                        "woop": woop_tag,
-                        "applied_cpu_cores": round(act_cpu_cores, 1),
-                        "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                        "reason": f"Applied {act_cpu_cores:.0f} CPU cores "
-                                  f"(WOOP recommends only {rec_cpu_cores:.1f})",
-                    })
-
-                # Broken multiplier — limit/request ratio far from expected
-                al = ctr.get("limits", {})
-                act_limit_mem = al.get("memory", 0)
-                if act_mem and act_limit_mem:
-                    applied_ratio = act_limit_mem / act_mem
-                    expected_mult = mem_limit_mult if mem_limit_mult > 0 else 1.5
-                    if applied_ratio > t.outlier_median_ratio:
-                        absurd.append({
-                            "workload": wl_key, "container": c_name,
-                            "woop": woop_tag,
-                            "applied_memory_gib": round(act_mem_gib, 1),
-                            "applied_limit_memory_gib": round(
-                                act_limit_mem / (1024**3), 1),
-                            "limit_request_ratio": round(applied_ratio, 1),
-                            "expected_multiplier": expected_mult,
-                            "reason": f"Limit/request ratio {applied_ratio:.0f}x "
-                                      f"(expected ~{expected_mult}x) — broken multiplier",
-                        })
-
-                # Mismatch checks
-                if act_mem and rec_mem:
-                    pct = abs(rec_mem - act_mem) / rec_mem * 100
-                    if pct > t.recommendation_mismatch_pct:
-                        mismatches.append({
-                            "workload": wl_key, "container": c_name,
-                            "woop": woop_tag,
-                            "recommended_memory": rec_mem,
-                            "actual_memory": act_mem, "diff_pct": round(pct, 1),
-                        })
-                if act_cpu and rec_cpu:
-                    pct = abs(rec_cpu - act_cpu) / rec_cpu * 100
-                    if pct > t.recommendation_mismatch_pct:
-                        mismatches.append({
-                            "workload": wl_key, "container": c_name,
-                            "woop": woop_tag,
-                            "recommended_cpu": rec_cpu,
-                            "actual_cpu": act_cpu, "diff_pct": round(pct, 1),
-                        })
-
-        snapshot.woop_workloads = workloads
+        # We don't get full workloads back (by design — saves bandwidth).
+        # Store an empty list; evaluator uses the findings directly.
+        snapshot.woop_workloads = []
         snapshot.recommendation_mismatches = mismatches
         snapshot.absurd_recommendations = absurd
         snapshot.data_gaps = data_gaps
+        snapshot.data_gaps_total = len(data_gaps)
+        snapshot.recommendation_mismatches_total = len(mismatches)
+        snapshot.absurd_recommendations_total = len(absurd)
 
-        # Store WOOP management summary as a log signal for evaluator
         snapshot.log_signals.append({
             "signal": "woop_management_summary",
-            "managed": woop_summary["managed"],
-            "read_only": woop_summary["read_only"],
-            "undefined": woop_summary["undefined"],
-            "total": len(workloads),
+            "managed": woop_summary.get("managed", 0),
+            "read_only": woop_summary.get("read_only", 0),
+            "undefined": woop_summary.get("undefined", 0),
+            "total": woop_summary.get("total", 0),
         })
 
         logger.info(
-            "WOOP: %d workloads (managed=%d, read_only=%d, undefined=%d), "
-            "%d mismatches, %d absurd, %d data gaps",
-            len(workloads), woop_summary["managed"], woop_summary["read_only"],
-            woop_summary["undefined"], len(mismatches), len(absurd), len(data_gaps),
+            "WOOP (analyze_with_code): %d workloads (managed=%d, read_only=%d, "
+            "undefined=%d), %d mismatches, %d absurd, %d data gaps",
+            woop_summary.get("total", 0), woop_summary.get("managed", 0),
+            woop_summary.get("read_only", 0), woop_summary.get("undefined", 0),
+            len(mismatches), len(absurd), len(data_gaps),
         )
 
     async def _mcp_oom_summary(self, snapshot: SnapshotData) -> None:
         """woop_get_oom_summary: OOM kills ranked by workload over last hour."""
         now = datetime.now(timezone.utc)
-        data = await self.mcp.call_tool("woop_get_oom_summary", {
+        oom_args = {
             "cluster_id_or_name": self.cluster_id,
             "from_date": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "to_date": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit": 20,
-        })
+        }
+        if self.org_id:
+            oom_args["organization_id"] = self.org_id
+        data = await self.mcp.call_tool("woop_get_oom_summary", oom_args)
         if not data:
             return  # non-fatal, snapshot_health already has OOM data
         if isinstance(data, str):
@@ -635,11 +706,377 @@ result = {
             len(woop_oom), len(kept_snapshot), len(snapshot.oomkilled_pods),
         )
 
+    # ── Backtest-mode WOOP reconstruction ──────────────────────────────
+
+    async def _mcp_woop_backtest(self, snapshot: SnapshotData) -> None:
+        """Reconstruct WOOP state at snapshot_time using historical metrics.
+
+        Strategy (metrics-based, since woop_get_workload_events has no
+        RECOMMENDED_REQUESTS_CHANGED retention):
+          Phase 1: woop_analyze_with_code (server-side) → screen candidates
+                   where current rec or applied exceeds 85% of absurd threshold.
+                   Returns top 30 candidates sorted by max resource value.
+          Phase 2: woop_get_workload_metrics (historical) → for each candidate,
+                   get actual recommended + applied values at snapshot_time.
+                   Then run absurd/mismatch detection on historical metrics.
+        """
+        snap_dt = datetime.fromisoformat(self.snapshot_time.replace("Z", "+00:00"))
+        # 24-hour window ending at snapshot_time for metrics.
+        # Narrow windows (1h) often return empty containers if the workload
+        # had no active metric collection during that period.
+        from_str = (snap_dt - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_str = snap_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        t = self.config.thresholds
+        known_s2z = self.config.cluster.known_scale_to_zero_workloads
+        known_s2z_json = json.dumps(known_s2z)
+        screen_mem_gib = t.absurd_memory_gib * 0.85
+        screen_cpu = t.absurd_cpu_cores * 0.85
+
+        # ── Phase 1: Server-side candidate screening ──
+        screen_code = f'''
+SCREEN_MEM_GIB = {screen_mem_gib}
+SCREEN_CPU = {screen_cpu}
+OUTLIER_RATIO = {t.outlier_median_ratio}
+KNOWN_S2Z = {known_s2z_json}
+
+workloads = get_workloads()
+
+candidates = []
+data_gaps = []
+summary = {{"managed": 0, "read_only": 0, "undefined": 0, "total": len(workloads)}}
+
+for wl in workloads:
+    wl_name = wl.get("name", "unknown")
+    wl_ns = wl.get("namespace", "unknown")
+    wl_key = wl_ns + "/" + wl_name
+    wl_id = wl.get("id", "")
+
+    wl_config = wl.get("workloadConfigV2") or {{}}
+    vpa_cfg = wl_config.get("vpaConfig") or {{}}
+    mgmt = vpa_cfg.get("managementOption", "UNDEFINED")
+    apply_type = vpa_cfg.get("applyType", "")
+    woop_tag = mgmt
+    if apply_type:
+        woop_tag = woop_tag + "/" + apply_type
+
+    if mgmt == "MANAGED":
+        summary["managed"] += 1
+    elif mgmt == "READ_ONLY":
+        summary["read_only"] += 1
+    else:
+        summary["undefined"] += 1
+
+    skip = False
+    for pat in KNOWN_S2Z:
+        if pat in wl_name:
+            skip = True
+            break
+    if skip:
+        continue
+
+    containers = wl.get("containers") or []
+
+    has_rec = False
+    for ctr in containers:
+        if ctr.get("recommendation"):
+            has_rec = True
+            break
+
+    pod_count = wl.get("podCount", 0) or 0
+
+    if mgmt == "MANAGED" and not has_rec and not containers:
+        if pod_count > 0:
+            data_gaps.append({{"workload": wl_key, "woop": woop_tag,
+                              "reason": "MANAGED but no recommendation or containers"}})
+        continue
+
+    # Only screen MANAGED workloads — READ_ONLY are informational
+    if mgmt != "MANAGED":
+        continue
+
+    flagged = False
+    max_res = 0.0
+    for ctr in containers:
+        res = ctr.get("resources") or {{}}
+        ar = res.get("requests") or {{}}
+        al = res.get("limits") or {{}}
+        act_mem = ar.get("memoryGib", 0) or 0
+        act_cpu = ar.get("cpuCores", 0) or 0
+        act_lim = al.get("memoryGib", 0) or 0
+        rec_data = ctr.get("recommendation") or {{}}
+        rr = rec_data.get("requests") or {{}}
+        rec_mem = rr.get("memoryGib", 0) or 0
+        rec_cpu = rr.get("cpuCores", 0) or 0
+        local_max = max(act_mem, act_lim, rec_mem, act_cpu, rec_cpu)
+        if local_max > max_res:
+            max_res = local_max
+        if act_mem > SCREEN_MEM_GIB or act_cpu > SCREEN_CPU or act_lim > SCREEN_MEM_GIB:
+            flagged = True
+        if rec_mem > SCREEN_MEM_GIB or rec_cpu > SCREEN_CPU:
+            flagged = True
+        if act_mem and act_lim and (act_lim / act_mem) > OUTLIER_RATIO:
+            flagged = True
+
+    if flagged and wl_id:
+        candidates.append({{"wl_key": wl_key, "wl_id": wl_id, "woop_tag": woop_tag, "max_res": max_res}})
+
+# Sort by max resource descending, cap at 30
+candidates.sort(key=lambda c: c["max_res"], reverse=True)
+candidates = candidates[:30]
+# Strip max_res before returning (not needed downstream)
+for c in candidates:
+    c.pop("max_res", None)
+
+result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}}
+'''
+
+        screen_args = {
+            "cluster_id_or_name": self.cluster_id,
+            "analysis_code": screen_code,
+            "description": "WOOP backtest: screen candidates for historical metrics verification",
+            "timeout": 45,
+        }
+        if self.org_id:
+            screen_args["organization_id"] = self.org_id
+
+        screen_data = await self.mcp.call_tool("woop_analyze_with_code", screen_args)
+        if not screen_data:
+            raise RuntimeError("woop_analyze_with_code (backtest screen) returned empty")
+        if isinstance(screen_data, str):
+            screen_data = json.loads(screen_data)
+        if isinstance(screen_data, dict) and "error" in screen_data and "error_type" in screen_data:
+            raise RuntimeError(
+                f"woop_analyze_with_code error: {screen_data['error']} "
+                f"(hint: {screen_data.get('hint', 'none')})"
+            )
+        if isinstance(screen_data, dict) and "result" in screen_data and screen_data.get("success"):
+            screen_data = screen_data["result"]
+
+        candidates = screen_data.get("candidates", [])
+        data_gaps = screen_data.get("data_gaps", [])
+        woop_summary = screen_data.get("summary", {})
+
+        total_workloads = woop_summary.get("total", 0)
+        logger.info(
+            "BACKTEST WOOP: %d workloads, %d candidates flagged for "
+            "historical metrics verification (server-side screening)",
+            total_workloads, len(candidates),
+        )
+
+        # ── Phase 2: Fetch historical metrics for candidates ──
+        mismatches = []
+        absurd = []
+        metrics_fetched = 0
+
+        if candidates:
+            # Fetch metrics concurrently in batches of 20
+            batch_size = 20
+            for i in range(0, len(candidates), batch_size):
+                batch = candidates[i:i + batch_size]
+                metric_args_list = []
+                for c in batch:
+                    m_args = {
+                        "cluster_id_or_name": self.cluster_id,
+                        "workload_id": c["wl_id"],
+                        "from_time": from_str,
+                        "to_time": to_str,
+                        "detail": "analysis",
+                    }
+                    if self.org_id:
+                        m_args["organization_id"] = self.org_id
+                    metric_args_list.append(m_args)
+
+                results = await asyncio.gather(
+                    *[self.mcp.call_tool("woop_get_workload_metrics", args)
+                      for args in metric_args_list],
+                    return_exceptions=True,
+                )
+
+                for cand, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "BACKTEST metrics failed for %s: %s",
+                            cand["wl_key"], result,
+                        )
+                        continue
+
+                    metrics_fetched += 1
+                    if isinstance(result, str):
+                        try:
+                            result = json.loads(result)
+                        except json.JSONDecodeError:
+                            continue
+                    if not isinstance(result, dict):
+                        continue
+
+                    wl_key = cand["wl_key"]
+                    woop_tag = cand["woop_tag"]
+
+                    for ctr_m in result.get("containers", []):
+                        c_name = ctr_m.get("name", "")
+                        mem = ctr_m.get("memory_gib", {})
+                        cpu = ctr_m.get("cpu_cores", {})
+
+                        rec_mem_gib = mem.get("recommended", 0) or 0
+                        req_mem_gib = mem.get("requested", 0) or 0
+                        rec_cpu_cores = cpu.get("recommended", 0) or 0
+                        req_cpu_cores = cpu.get("requested", 0) or 0
+
+                        # Absurd recommendation checks
+                        if rec_mem_gib > t.absurd_memory_gib:
+                            absurd.append({
+                                "workload": wl_key, "container": c_name,
+                                "woop": woop_tag,
+                                "recommended_memory_gib": round(rec_mem_gib, 1),
+                                "applied_memory_gib": round(req_mem_gib, 1),
+                                "reason": f"Historical WOOP recommended "
+                                          f"{rec_mem_gib:.1f} GiB memory "
+                                          f"(applied {req_mem_gib:.1f} GiB)",
+                                "source": "woop_metrics_backtest",
+                            })
+                        if rec_cpu_cores > t.absurd_cpu_cores:
+                            absurd.append({
+                                "workload": wl_key, "container": c_name,
+                                "woop": woop_tag,
+                                "recommended_cpu_cores": round(rec_cpu_cores, 1),
+                                "applied_cpu_cores": round(req_cpu_cores, 1),
+                                "reason": f"Historical WOOP recommended "
+                                          f"{rec_cpu_cores:.1f} CPU cores "
+                                          f"(applied {req_cpu_cores:.1f})",
+                                "source": "woop_metrics_backtest",
+                            })
+
+                        # Also flag absurd applied values
+                        if req_mem_gib > t.absurd_memory_gib:
+                            absurd.append({
+                                "workload": wl_key, "container": c_name,
+                                "woop": woop_tag,
+                                "applied_memory_gib": round(req_mem_gib, 1),
+                                "recommended_memory_gib": round(rec_mem_gib, 1),
+                                "reason": f"Applied {req_mem_gib:.1f} GiB memory "
+                                          f"(recommended {rec_mem_gib:.1f} GiB)",
+                                "source": "woop_metrics_backtest",
+                            })
+                        if req_cpu_cores > t.absurd_cpu_cores:
+                            absurd.append({
+                                "workload": wl_key, "container": c_name,
+                                "woop": woop_tag,
+                                "applied_cpu_cores": round(req_cpu_cores, 1),
+                                "recommended_cpu_cores": round(rec_cpu_cores, 1),
+                                "reason": f"Applied {req_cpu_cores:.1f} CPU cores "
+                                          f"(recommended {rec_cpu_cores:.1f})",
+                                "source": "woop_metrics_backtest",
+                            })
+
+                        # Mismatch checks (requires both % AND absolute delta)
+                        if req_mem_gib and rec_mem_gib:
+                            pct = abs(rec_mem_gib - req_mem_gib) / rec_mem_gib * 100
+                            abs_delta = abs(rec_mem_gib - req_mem_gib)
+                            if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_memory_gib:
+                                mismatches.append({
+                                    "workload": wl_key, "container": c_name,
+                                    "woop": woop_tag,
+                                    "recommended_memory_gib": round(rec_mem_gib, 1),
+                                    "actual_memory_gib": round(req_mem_gib, 1),
+                                    "diff_pct": round(pct, 1),
+                                    "source": "woop_metrics_backtest",
+                                })
+                        if req_cpu_cores and rec_cpu_cores:
+                            pct = abs(rec_cpu_cores - req_cpu_cores) / rec_cpu_cores * 100
+                            abs_delta = abs(rec_cpu_cores - req_cpu_cores)
+                            if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_cpu_cores:
+                                mismatches.append({
+                                    "workload": wl_key, "container": c_name,
+                                    "woop": woop_tag,
+                                    "recommended_cpu_cores": round(rec_cpu_cores, 1),
+                                    "actual_cpu_cores": round(req_cpu_cores, 1),
+                                    "diff_pct": round(pct, 1),
+                                    "source": "woop_metrics_backtest",
+                                })
+
+        snapshot.woop_workloads = []
+        snapshot.recommendation_mismatches = mismatches
+        snapshot.absurd_recommendations = absurd
+        snapshot.data_gaps = data_gaps
+        snapshot.data_gaps_total = len(data_gaps)
+        snapshot.recommendation_mismatches_total = len(mismatches)
+        snapshot.absurd_recommendations_total = len(absurd)
+
+        snapshot.log_signals.append({
+            "signal": "woop_management_summary",
+            "managed": woop_summary.get("managed", 0),
+            "read_only": woop_summary.get("read_only", 0),
+            "undefined": woop_summary.get("undefined", 0),
+            "total": total_workloads,
+            "backtest": True,
+            "candidates_screened": len(candidates),
+            "metrics_fetched": metrics_fetched,
+        })
+
+        logger.info(
+            "BACKTEST WOOP: %d workloads, %d candidates, %d metrics fetched, "
+            "%d mismatches, %d absurd, %d data gaps",
+            total_workloads, len(candidates), metrics_fetched,
+            len(mismatches), len(absurd), len(data_gaps),
+        )
+
+    async def _mcp_oom_summary_backtest(self, snapshot: SnapshotData) -> None:
+        """woop_get_oom_summary with historical time range for backtest mode."""
+        snap_dt = datetime.fromisoformat(self.snapshot_time.replace("Z", "+00:00"))
+        from_dt = snap_dt - timedelta(hours=1)
+
+        bt_oom_args = {
+            "cluster_id_or_name": self.cluster_id,
+            "from_date": from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to_date": snap_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": 20,
+        }
+        if self.org_id:
+            bt_oom_args["organization_id"] = self.org_id
+        data = await self.mcp.call_tool("woop_get_oom_summary", bt_oom_args)
+        if not data:
+            logger.info("BACKTEST OOM: no data returned for window ending %s", self.snapshot_time)
+            return
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        oom_workloads = data if isinstance(data, list) else data.get("workloads", [])
+
+        woop_oom = []
+        for oom in oom_workloads:
+            woop_oom.append({
+                "namespace": oom.get("namespace", ""),
+                "name": oom.get("workload_name", ""),
+                "oom_count": oom.get("oom_count", 0),
+                "first_oom": oom.get("first_oom", ""),
+                "last_oom": oom.get("last_oom", ""),
+                "source": "woop_events_backtest",
+            })
+
+        woop_keys = {f"{o['namespace']}/{o['name']}" for o in woop_oom}
+        kept_snapshot = [
+            o for o in snapshot.oomkilled_pods
+            if o.get("source") == "snapshot_lastState"
+            and f"{o.get('namespace')}/{o.get('name')}" not in woop_keys
+        ]
+        snapshot.oomkilled_pods = woop_oom + kept_snapshot
+
+        logger.info(
+            "BACKTEST OOM: %d from WOOP events, %d from snapshot, %d total "
+            "(window: %s to %s)",
+            len(woop_oom), len(kept_snapshot), len(snapshot.oomkilled_pods),
+            from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), self.snapshot_time,
+        )
+
+    # ── End backtest methods ──────────────────────────────────────────
+
     async def _mcp_resource_ratios(self, snapshot: SnapshotData) -> None:
         """woop_get_workload_resource_ratios: flag tight limits + collect memory usage."""
-        data = await self.mcp.call_tool("woop_get_workload_resource_ratios", {
-            "cluster_id_or_name": self.cluster_id,
-        })
+        ratio_args = {"cluster_id_or_name": self.cluster_id}
+        if self.org_id:
+            ratio_args["organization_id"] = self.org_id
+        data = await self.mcp.call_tool("woop_get_workload_resource_ratios", ratio_args)
         if not data:
             return
         if isinstance(data, str):
@@ -727,7 +1164,12 @@ result = {
                 snapshot.total_pods = pod_count
 
     async def _mcp_loki_signals(self, snapshot: SnapshotData) -> None:
-        """loki_query: evictor blocks, WA mutations, safety mechanism events."""
+        """loki_query: evictor blocks, WA mutations, safety mechanism events.
+
+        Uses raw LogQL because the structured log tools (search_logs,
+        get_logs_by_cluster_and_service) don't support service="workload-autoscaler"
+        — they only map known service names like "autoscaler", "agent", "evictor".
+        """
         queries = [
             ("wa_mutation_errors",
              '{app="workload-autoscaler"} '
@@ -963,30 +1405,45 @@ result = {
             if any(pat in wl_name for pat in known_s2z):
                 continue
 
-            rec = wl.get("recommendation", {})
             containers = wl.get("containers", [])
 
-            if mgmt == "MANAGED" and not rec:
-                data_gaps.append({
-                    "workload": wl_key, "woop": woop_tag,
-                    "reason": "MANAGED but no active recommendation",
-                })
-                continue
-            if not rec or not containers:
-                continue
-
-            rec_map = {c.get("containerName"): c for c in rec.get("containers", [])}
+            # Check if any container has a recommendation
+            has_rec = False
             for ctr in containers:
-                c_name = ctr.get("containerName", "")
-                rc = rec_map.get(c_name, {})
-                if not rc:
-                    continue
-                rr, ar = rc.get("requests", {}), ctr.get("requests", {})
-                rec_mem, act_mem = rr.get("memory", 0), ar.get("memory", 0)
-                rec_cpu, act_cpu = rr.get("cpu", 0), ar.get("cpu", 0)
+                if ctr.get("recommendation"):
+                    has_rec = True
+                    break
 
-                rec_mem_gib = rec_mem / (1024**3) if rec_mem else 0
-                rec_cpu_cores = rec_cpu / 1000 if rec_cpu else 0
+            pod_count = wl.get("podCount", 0) or 0
+
+            if mgmt == "MANAGED" and not has_rec:
+                if pod_count > 0:
+                    data_gaps.append({
+                        "workload": wl_key, "woop": woop_tag,
+                        "reason": "MANAGED but no active recommendation",
+                    })
+                continue
+            # Only flag MANAGED workloads for mismatch/absurd
+            if mgmt != "MANAGED":
+                continue
+            if not has_rec or not containers:
+                continue
+
+            for ctr in containers:
+                c_name = ctr.get("containerName", ctr.get("name", ""))
+                # API returns values in GiB and cores
+                res = ctr.get("resources") or {}
+                ar = res.get("requests") or {}
+                al = res.get("limits") or {}
+                act_mem_gib = ar.get("memoryGib", 0) or 0
+                act_cpu_cores = ar.get("cpuCores", 0) or 0
+                act_lim_mem_gib = al.get("memoryGib", 0) or 0
+
+                rec_data = ctr.get("recommendation") or {}
+                rr = rec_data.get("requests") or {}
+                rec_mem_gib = rr.get("memoryGib", 0) or 0
+                rec_cpu_cores = rr.get("cpuCores", 0) or 0
+
                 if rec_mem_gib > t.absurd_memory_gib:
                     absurd.append({"workload": wl_key, "container": c_name,
                                    "woop": woop_tag,
@@ -998,30 +1455,30 @@ result = {
                                    "recommended_cpu_cores": round(rec_cpu_cores, 1),
                                    "reason": f"WOOP recommends {rec_cpu_cores:.0f} cores"})
 
-                # Broken multiplier check
-                al = ctr.get("limits", {})
-                act_limit_mem = al.get("memory", 0)
-                if act_mem and act_limit_mem:
-                    applied_ratio = act_limit_mem / act_mem
-                    expected_mult = mem_limit_mult if mem_limit_mult > 0 else 1.5
-                    if applied_ratio > t.outlier_median_ratio:
-                        absurd.append({
-                            "workload": wl_key, "container": c_name,
-                            "woop": woop_tag,
-                            "limit_request_ratio": round(applied_ratio, 1),
-                            "expected_multiplier": expected_mult,
-                            "reason": f"Limit/request ratio {applied_ratio:.0f}x "
-                                      f"(expected ~{expected_mult}x)",
-                        })
+                # Ratio breach: recommendation >= 10x current request
+                if act_mem_gib > 0 and rec_mem_gib >= act_mem_gib * t.outlier_median_ratio:
+                    rec_ratio = round(rec_mem_gib / act_mem_gib, 1)
+                    absurd.append({
+                        "workload": wl_key, "container": c_name,
+                        "woop": woop_tag,
+                        "sub_type": "ratio_breach",
+                        "recommended_memory_gib": round(rec_mem_gib, 1),
+                        "applied_memory_gib": round(act_mem_gib, 1),
+                        "limit_request_ratio": rec_ratio,
+                        "reason": f"Rec {rec_mem_gib:.1f} GiB is {rec_ratio}x "
+                                  f"the current request {act_mem_gib:.1f} GiB",
+                    })
 
-                if act_mem and rec_mem:
-                    pct = abs(rec_mem - act_mem) / rec_mem * 100
-                    if pct > t.recommendation_mismatch_pct:
+                if act_mem_gib and rec_mem_gib:
+                    pct = abs(rec_mem_gib - act_mem_gib) / rec_mem_gib * 100
+                    abs_delta = abs(rec_mem_gib - act_mem_gib)
+                    if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_memory_gib:
                         mismatches.append({"workload": wl_key, "container": c_name,
                                            "woop": woop_tag, "diff_pct": round(pct, 1)})
-                if act_cpu and rec_cpu:
-                    pct = abs(rec_cpu - act_cpu) / rec_cpu * 100
-                    if pct > t.recommendation_mismatch_pct:
+                if act_cpu_cores and rec_cpu_cores:
+                    pct = abs(rec_cpu_cores - act_cpu_cores) / rec_cpu_cores * 100
+                    abs_delta = abs(rec_cpu_cores - act_cpu_cores)
+                    if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_cpu_cores:
                         mismatches.append({"workload": wl_key, "container": c_name,
                                            "woop": woop_tag, "diff_pct": round(pct, 1)})
 
@@ -1029,6 +1486,9 @@ result = {
         snapshot.recommendation_mismatches = mismatches
         snapshot.absurd_recommendations = absurd
         snapshot.data_gaps = data_gaps
+        snapshot.data_gaps_total = len(data_gaps)
+        snapshot.recommendation_mismatches_total = len(mismatches)
+        snapshot.absurd_recommendations_total = len(absurd)
 
         snapshot.log_signals.append({
             "signal": "woop_management_summary",

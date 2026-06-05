@@ -503,14 +503,23 @@ class MCPClient:
         code: str,
         description: str,
         timeout: int = 30,
+        snapshot_time: str | None = None,
     ) -> Any:
-        """Convenience: call analyze_snapshot_with_code."""
-        return await self.call_tool("analyze_snapshot_with_code", {
+        """Convenience: call analyze_snapshot_with_code.
+
+        Args:
+            snapshot_time: ISO 8601 timestamp to analyze a historical snapshot
+                           instead of the latest. e.g. "2026-05-21T05:00:00Z"
+        """
+        args = {
             "cluster_id_or_name": cluster_id,
             "analysis_code": code,
             "description": description,
             "timeout": timeout,
-        })
+        }
+        if snapshot_time:
+            args["snapshot_time"] = snapshot_time
+        return await self.call_tool("analyze_snapshot_with_code", args)
 
     async def loki_query(
         self,

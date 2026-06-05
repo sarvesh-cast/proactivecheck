@@ -70,6 +70,10 @@ class SnapshotData:
     recommendation_mismatches: list[dict] = field(default_factory=list)
     absurd_recommendations: list[dict] = field(default_factory=list)
     data_gaps: list[dict] = field(default_factory=list)
+    # Total counts (before capping) — so LLM knows the real numbers
+    data_gaps_total: int = 0
+    recommendation_mismatches_total: int = 0
+    absurd_recommendations_total: int = 0
 
     # CAST AI agent health
     agent_pods: list[dict] = field(default_factory=list)

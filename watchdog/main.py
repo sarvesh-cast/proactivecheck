@@ -32,6 +32,16 @@ Usage:
     # Use a fixture file instead of live API (offline testing)
     python -m watchdog --evaluator-only --fixture snapshot_fixture.json
 
+    # ── Backtest mode (historical snapshot analysis) ─────────────
+    # Collect + evaluate at specific historical timestamps
+    python -m watchdog --backtest 2026-05-21T05:00:00Z
+
+    # Multiple timestamps (builds rolling window across them)
+    python -m watchdog --backtest 2026-05-21T05:00:00Z 2026-06-01T18:30:00Z
+
+    # Single snapshot at a specific time (collector-only)
+    python -m watchdog --collector-only --snapshot-time 2026-05-21T05:00:00Z
+
 Environment variables:
     CASTAI_API_KEY or CASTAI_JWT_TOKEN  — CAST AI authentication
     CASTAI_ORG_ID                       — Organization ID
@@ -179,9 +189,10 @@ def _config_for_cluster(base_config: WatchdogConfig, cluster_id: str, cluster_na
 class Watchdog:
     """Orchestrates the collect → evaluate → notify pipeline."""
 
-    def __init__(self, config: WatchdogConfig | None = None) -> None:
+    def __init__(self, config: WatchdogConfig | None = None, snapshot_time: str | None = None) -> None:
         self.config = config or WatchdogConfig()
-        self.collector = Collector(self.config)
+        self.snapshot_time = snapshot_time
+        self.collector = Collector(self.config, snapshot_time=snapshot_time)
         self.evaluator = Evaluator(self.config)
         self.state = StateManager(
             self.config.state_file, self.config.rolling_window_size
@@ -225,7 +236,8 @@ class Watchdog:
             pod_delta_pct = self.state.compute_pod_count_delta_pct()
             agent_restart_delta = self.state.compute_agent_restarts_last_hour()
             memory_leaks = self.state.detect_memory_leaks()
-            mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0)
+            # Suppress data_gap on cold start — need ≥3 snapshots to establish baseline
+            mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0) if len(history) >= 3 else []
             mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
             oomkill_trend = self.state.get_oomkill_trend()
 
@@ -268,6 +280,82 @@ class Watchdog:
             result.verdict.value,
             self.config.run_interval_seconds,
         )
+
+    async def run_backtest(self, timestamps: list[str]) -> None:
+        """Run collect + evaluate at each historical timestamp.
+
+        Simulates the rolling window by collecting each timestamp in order
+        and building up state, then evaluating. Always dry-run (no Slack).
+
+        Usage:
+            python -m watchdog --backtest 2026-05-21T05:00:00Z 2026-06-01T18:30:00Z
+        """
+        logger.info("=== BACKTEST MODE: %d timestamps for cluster %s ===",
+                     len(timestamps), self.config.cluster.cluster_id)
+
+        for i, ts in enumerate(timestamps, 1):
+            logger.info("── Backtest %d/%d: snapshot_time=%s ──", i, len(timestamps), ts)
+
+            # Swap the collector's snapshot_time for this iteration
+            self.collector.snapshot_time = ts
+
+            try:
+                snapshot = await self.collector.collect()
+                logger.info(
+                    "Collected @ %s: %d pods (%d OOM, %d Pending, %d CrashLoop), "
+                    "%d nodes, %d errors",
+                    ts, snapshot.total_pods, len(snapshot.oomkilled_pods),
+                    snapshot.pending_pods, snapshot.crashloop_pods,
+                    snapshot.node_count, len(snapshot.collection_errors),
+                )
+            except Exception as e:
+                logger.error("Collection failed for %s: %s", ts, e, exc_info=True)
+                continue
+
+            # Push to rolling window (builds up state across timestamps)
+            self.state.push_snapshot(snapshot.to_dict_compact())
+            self.state.update_data_gaps(snapshot.data_gaps)
+            self.state.update_pending_pods(snapshot.pending_pods_detail)
+
+            # Evaluate
+            try:
+                history = self.state.get_snapshots()
+                node_delta = self.state.compute_node_count_delta_pct()
+                pod_delta = self.state.compute_pod_count_delta_pct()
+                agent_restart_delta = self.state.compute_agent_restarts_last_hour()
+                memory_leaks = self.state.detect_memory_leaks()
+                mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0) if len(history) >= 3 else []
+                mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
+                oomkill_trend = self.state.get_oomkill_trend()
+
+                result = await self.evaluator.evaluate(
+                    snapshot, history, node_delta,
+                    pod_count_delta_pct=pod_delta,
+                    agent_restarts_last_hour=agent_restart_delta,
+                    memory_leaks=memory_leaks,
+                    mature_data_gaps=mature_data_gaps,
+                    mature_pending_pods=mature_pending,
+                    oomkill_trend=oomkill_trend,
+                )
+
+                # Print results
+                print(f"\n{'='*70}")
+                print(f"  BACKTEST RESULT @ {ts}")
+                print(f"{'='*70}")
+                print(f"  Verdict: {result.verdict.value}")
+                print(f"  Findings: {len(result.findings)}")
+                for f in result.findings:
+                    print(f"    [{f.severity.value:8s}] {f.category.value:25s} {f.workload}")
+                    print(f"             {f.what}")
+                    print(f"             Evidence: {f.evidence[:200]}")
+                print(f"{'='*70}\n")
+
+            except Exception as e:
+                logger.error("Evaluation failed for %s: %s", ts, e, exc_info=True)
+
+        # Save state at the end (useful for inspection)
+        self.state.save()
+        logger.info("=== BACKTEST COMPLETE: %d timestamps processed ===", len(timestamps))
 
     async def run_loop(self) -> None:
         """Run the watchdog continuously on a 5-minute schedule.
@@ -386,7 +474,7 @@ class Watchdog:
         pod_delta = self.state.compute_pod_count_delta_pct()
         agent_restart_delta = self.state.compute_agent_restarts_last_hour()
         memory_leaks = self.state.detect_memory_leaks()
-        mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0)
+        mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0) if len(history) >= 3 else []
         mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
         oomkill_trend = self.state.get_oomkill_trend()
 
@@ -426,14 +514,15 @@ class Watchdog:
         Slack message format.
         """
         logger.info("Running notifier test (dry-run)")
+        cluster_id = self.config.cluster.cluster_id or "test-cluster"
         test_result = EvaluationResult(
             verdict=Verdict.CRITICAL,
-            summary="[TEST] Synthetic evaluation for notifier testing",
+            summary=f"[TEST] Synthetic evaluation for notifier testing ({cluster_id[:8]})",
             findings=[
                 Finding(
                     severity=Severity.CRITICAL,
                     category=FindingCategory.OOMKILL,
-                    workload="cengage/discovery-puller",
+                    workload="test-namespace/test-workload",
                     what="OOMKill spiral detected (test)",
                     evidence="6 OOMKills in the last hour (3x threshold); "
                              "Memory limit is 128 MiB but workload needs ~1.2 GiB",
@@ -442,7 +531,7 @@ class Watchdog:
                 Finding(
                     severity=Severity.WARNING,
                     category=FindingCategory.AGENT_RESTART,
-                    workload="castai-agent/castai-agent-xyz",
+                    workload="castai-agent/castai-agent-pod-abc",
                     what="CAST AI agent restart count elevated (test)",
                     evidence="restartCount=2 in last hour",
                     suggested_action="Monitor — will escalate to CRITICAL at 3/hour",
@@ -534,6 +623,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="With --evaluator-only: skip LLM, use threshold checks")
     p.add_argument("--fixture", type=str, default=None,
                     help="With --evaluator-only: load snapshot from JSON file")
+    p.add_argument("--snapshot-time", type=str, default=None,
+                    help="ISO 8601 timestamp for historical snapshot (backtest mode). "
+                         "e.g. 2026-05-21T05:00:00Z")
+    p.add_argument("--backtest", type=str, nargs="+", default=None,
+                    metavar="TIMESTAMP",
+                    help="Run collect+evaluate at one or more historical timestamps. "
+                         "e.g. --backtest 2026-05-21T05:00:00Z 2026-06-01T18:30:00Z")
 
     return p
 
@@ -563,9 +659,12 @@ async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
         if is_multi:
             logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
 
-        watchdog = Watchdog(cfg)
+        snapshot_time = getattr(args, "snapshot_time", None)
+        watchdog = Watchdog(cfg, snapshot_time=snapshot_time)
 
-        if args.state_dump:
+        if getattr(args, "backtest", None):
+            await watchdog.run_backtest(args.backtest)
+        elif args.state_dump:
             watchdog.dump_state()
         elif args.collector_only:
             await watchdog.run_collector_only()

@@ -35,43 +35,21 @@ from .models import (
 
 logger = logging.getLogger("watchdog.evaluator")
 
-# ── System prompt (from design doc, page 5-7) ────────────────────────
+# ── System prompt (dynamic — cluster context injected from config) ───
 
-SYSTEM_PROMPT = """SYSTEM PROMPT FOR CLUSTER WATCHDOG EVALUATION
+SYSTEM_PROMPT_TEMPLATE = """SYSTEM PROMPT FOR CLUSTER WATCHDOG EVALUATION
 
 You are an SRE monitoring agent for CAST AI. You inspect Kubernetes
 cluster snapshots every 5 minutes and identify anomalies that need
 human attention. Your job is to reduce noise—only flag things that
 a senior SRE would actually investigate.
 
-## Cluster Context (Grip Security — prod-us-4)
+## Cluster Context ({cluster_name})
 
-Known baseline behaviors (DO NOT flag these as anomalies):
-- aggregator workloads in every namespace routinely scale to zero
-  replicas. Seeing 0/0 ready pods for aggregator is NORMAL.
-- discovery-puller workloads have high memory usage (800MB-1.5GB
-  per pod is expected). Flag only if limits are set far below this.
-- Some namespaces are low-traffic and may show 0 resource usage.
-  This is not an incident.
-
-Known configuration:
-- WOOP memory limit multiplier: 1.5x (recently corrected from 100x)
-- WOOP recommendation strategy: Max Usage (NOTE: this strategy is
-  vulnerable to outlier pods driving extreme recommendations —
-  flag any recommendation where a single pod's usage is >10x the
-  median of its siblings as a potential outlier-driven spike)
-- Cluster ID: {cluster_id}
-- Multiple customer namespaces (cengage, williamsmullen,
-  oscarhealth, ensemblehealthpartners, athenahealth, and others)
-- Cilium CNI in use — nodes may briefly show cilium agent-not-ready
-  taint during startup. This is normal and transient (<2 min).
-- Customer uses KEDA for some workloads — rapid replica changes
-  driven by KEDA are expected and should not trigger cascading
-  scaling alerts unless node count also spikes disproportionately.
+{cluster_context}
 
 Known fragile components (extra scrutiny):
-- castai-agent: has a history of ExitCode:0 silent failures and
-  OOM issues. Any restart is worth logging; >3/hour is CRITICAL.
+- castai-agent: Any restart is worth logging; >{agent_restart_critical}/hour is CRITICAL.
 - castai-workload-autoscaler: should be running with 2 replicas.
   If only 1 replica is Running, flag as WARNING.
 - castai-workload-autoscaler-exporter: watch for metric limit
@@ -83,20 +61,20 @@ Known fragile components (extra scrutiny):
 Analyze the following snapshot and trailing history. Produce a JSON
 response with this exact structure:
 
-{{
+{{{{
   "verdict": "HEALTHY" | "WARNING" | "CRITICAL",
   "summary": "<one sentence overall assessment>",
   "findings": [
-    {{
+    {{{{
       "severity": "critical" | "warning" | "info",
       "category": "<oomkill|mismatch|unschedulable|agent|data_gap|memory_leak|absurd_recommendation|agent_restart|webhook_failure|cascading_scaling|config|other>",
       "workload": "<namespace/workload or cluster-level>",
       "what": "<what is happening>",
       "evidence": "<specific numbers from the snapshot>",
       "suggested_action": "<what the TAM or customer should do>"
-    }}
+    }}}}
   ],
-  "metrics": {{
+  "metrics": {{{{
     "total_pods": <int>,
     "oomkilled_pods": <int>,
     "pending_pods": <int>,
@@ -107,51 +85,130 @@ response with this exact structure:
     "agent_restarts_last_hour": <int>,
     "node_count": <int>,
     "node_count_delta_pct": <float>
-  }}
-}}
+  }}}}
+}}}}
 
 ## Classification Rules
 
 CRITICAL (post immediately):
-- Any pod OOMKilled more than 3 times in the last hour
-- Any WOOP recommendation where applied value differs from intended by more than 50%
+- Any pod OOMKilled more than {oomkill_critical} times in the last hour
+- Any WOOP recommendation where applied value differs from intended by more than {mismatch_pct}%
 - Any workload with all replicas in CrashLoopBackOff
 - CAST AI agent pod not running
-- Any pod Pending for more than 15 minutes
-- Any WOOP recommendation exceeding 100 GiB memory or 100 CPU cores for a single workload. This is ALWAYS a bug or runaway logic — no discovery-puller pod should ever need 10 TB of RAM. Check woop_get_workloads for the raw recommendation values.
-- CAST AI agent pod restarting more than 3 times in the last hour, or showing ExitCode:0 with restartCount > 5. Silent agent failures have caused multi-day outages for this customer.
-- Cluster node count or total pod count increased by >50% vs. the trailing 1-hour average without a corresponding deployment event (cascading scaling / runaway autoscaler).
+- Any pod Pending for more than {pending_minutes} minutes
+- Any WOOP recommendation exceeding {absurd_mem_gib} GiB memory or {absurd_cpu} CPU cores for a single workload. This is ALWAYS a bug or runaway logic.
+- CAST AI agent pod restarting more than {agent_restart_critical} times in the last hour, or showing ExitCode:0 with restartCount > {agent_restart_count_critical}.
+- Cluster node count or total pod count increased by >{node_spike_pct}% vs. the trailing 1-hour average without a corresponding deployment event (cascading scaling / runaway autoscaler).
 
 WARNING (post, but less urgent):
 - OOMKill count increasing but below critical threshold
-- Memory usage trending upward across 3+ consecutive snapshots without leveling off (potential leak)
-- Workload with optimization enabled but no recommendation for >2 hours
-- Node running at >90% memory utilization
-- CAST AI agent pod restartCount between 1-3 in the last hour (early signal before it becomes critical)
-- Workload autoscaler webhook not responding or exporter pod not Running (recommendations won't be applied even if correct)
-- Any single pod memory usage exceeding 2x its request across 3+ snapshots (potential memory leak in the application itself, which will eventually trigger OOM recovery compounding)
+- Memory usage trending upward across {leak_snapshots}+ consecutive snapshots without leveling off (potential leak)
+- Workload with optimization enabled but no recommendation for >{data_gap_hours} hours
+- Node running at >{node_mem_pct}% memory utilization
+- CAST AI agent pod restartCount between 1-{agent_restart_critical} in the last hour
+- Workload autoscaler webhook not responding or exporter pod not Running
+- Any single pod memory usage exceeding {mem_over_request}x its request across 3+ snapshots (potential memory leak)
 
 HEALTHY (do not post):
 - All pods Running with expected restart counts
 - Resource usage within expected ranges
-- Aggregator at zero replicas (this is normal)
+- Scale-to-zero workloads at zero replicas (this is normal)
 - Sporadic single OOMKill with no repeat (transient)
+
+## Important: Counts and Totals
+
+The snapshot data below may show CAPPED lists (e.g. only 10 data_gaps or
+10 recommendation_mismatches). The REAL total count is in the corresponding
+`*_total` field. For example:
+- `data_gaps_total` = actual number of MANAGED workloads with no recommendation
+- `recommendation_mismatches_total` = actual number of mismatches
+- `absurd_recommendations_total` = actual number of absurd recommendations
+
+ALWAYS use the `*_total` fields when reporting counts in your findings.
+Do NOT count the items in the capped list — that will undercount.
+
+Also: do NOT fabricate resource values. If claiming a specific ratio like
+"100x limit" or a specific byte amount, verify the exact numbers from the
+snapshot containers or WOOP data. Stale or incorrect numbers erode trust.
 
 ## Snapshot Data
 
-{snapshot_json}
+{{snapshot_json}}
 
-## Trailing History (last {window_size} snapshots)
+## Trailing History (last {{window_size}} snapshots)
 
-{history_json}
+{{history_json}}
 
 ## Collection Errors
 
-{collection_errors}
+{{collection_errors}}
 
 IMPORTANT: If collection errors exist, note which data sources are missing
 and reduce confidence in your assessment accordingly. Do NOT report missing
 data as a cluster problem — it's an observability gap."""
+
+
+def _build_cluster_context(config: WatchdogConfig) -> str:
+    """Build the cluster context section from config, not hardcoded values."""
+    ctx = config.cluster
+    lines = []
+
+    # Known baseline behaviors
+    lines.append("Known baseline behaviors (DO NOT flag these as anomalies):")
+    if ctx.known_scale_to_zero_workloads:
+        wl_list = ", ".join(ctx.known_scale_to_zero_workloads)
+        lines.append(f"- {wl_list} workloads routinely scale to zero replicas.")
+        lines.append("  Seeing 0/0 ready pods for these is NORMAL.")
+    lines.append("- Some namespaces are low-traffic and may show 0 resource usage.")
+    lines.append("  This is not an incident.")
+    lines.append("")
+
+    # Known configuration
+    lines.append("Known configuration:")
+    lines.append(f"- WOOP memory limit multiplier: {ctx.woop_memory_limit_multiplier}x")
+    lines.append(f"- WOOP recommendation strategy: {ctx.woop_recommendation_strategy}")
+    if ctx.woop_recommendation_strategy == "Max Usage":
+        lines.append("  (NOTE: this strategy is vulnerable to outlier pods driving")
+        lines.append("  extreme recommendations — flag any recommendation where a")
+        lines.append("  single pod's usage is >10x the median of its siblings)")
+    lines.append(f"- Cluster ID: {ctx.cluster_id}")
+    if ctx.namespaces:
+        ns_list = ", ".join(ctx.namespaces)
+        lines.append(f"- Customer namespaces include: {ns_list}")
+    if ctx.cni:
+        lines.append(f"- {ctx.cni.title()} CNI in use — nodes may briefly show")
+        lines.append(f"  {ctx.cni} agent-not-ready taint during startup (normal, <2 min).")
+    if ctx.uses_keda:
+        lines.append("- KEDA is in use — rapid replica changes driven by KEDA are")
+        lines.append("  expected. Only flag if node count also spikes disproportionately.")
+
+    return "\n".join(lines)
+
+
+def build_system_prompt(config: WatchdogConfig) -> str:
+    """Build the full system prompt with cluster context and thresholds from config."""
+    t = config.thresholds
+    ctx = config.cluster
+
+    # First pass: inject config values into the template
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        cluster_name=ctx.cluster_name or ctx.cluster_id[:12],
+        cluster_context=_build_cluster_context(config),
+        agent_restart_critical=t.agent_restart_critical_per_hour,
+        oomkill_critical=t.oomkill_critical_per_hour,
+        mismatch_pct=t.recommendation_mismatch_pct,
+        pending_minutes=t.pending_pod_minutes,
+        absurd_mem_gib=t.absurd_memory_gib,
+        absurd_cpu=t.absurd_cpu_cores,
+        agent_restart_count_critical=t.agent_restart_count_critical,
+        node_spike_pct=t.node_count_spike_pct,
+        leak_snapshots=t.memory_leak_snapshots,
+        data_gap_hours=t.data_gap_hours,
+        node_mem_pct=t.node_memory_utilization_pct,
+        mem_over_request=t.memory_usage_over_request_ratio,
+    )
+
+    return prompt
 
 
 class Evaluator:
@@ -183,8 +240,10 @@ class Evaluator:
 
         # Build the prompt with a compact snapshot (strip bulk WOOP data)
         compact_snap = self._compact_snapshot(snapshot, mature_data_gaps or [])
-        prompt = SYSTEM_PROMPT.format(
-            cluster_id=self.config.cluster.cluster_id,
+        # Two-stage formatting: build_system_prompt injects config values,
+        # then we inject the runtime snapshot/history data.
+        base_prompt = build_system_prompt(self.config)
+        prompt = base_prompt.format(
             snapshot_json=json.dumps(compact_snap, indent=2, default=str),
             history_json=json.dumps(
                 self._compact_history(history), indent=2, default=str
@@ -210,7 +269,11 @@ class Evaluator:
                     result = await self._call_llm(prompt, model)
                     if result:
                         # Cross-check LLM findings against raw data
-                        validated = self._validate_llm_result(result, raw_result, snapshot)
+                        validated = self._validate_llm_result(
+                            result, raw_result, snapshot,
+                            node_count_delta_pct=node_count_delta_pct,
+                            pod_count_delta_pct=pod_count_delta_pct,
+                        )
                         return validated
                     # JSON parse failed — retry with same model before switching
                     if attempt < 3:
@@ -414,6 +477,8 @@ class Evaluator:
         llm_result: EvaluationResult,
         raw_result: EvaluationResult,
         snapshot: SnapshotData,
+        node_count_delta_pct: float = 0.0,
+        pod_count_delta_pct: float = 0.0,
     ) -> EvaluationResult:
         """Cross-check LLM findings against raw snapshot data to eliminate hallucinations.
 
@@ -438,6 +503,27 @@ class Evaluator:
         agent_names = {a.get("name", "") for a in snapshot.agent_pods}
         agent_not_running = any(a.get("phase") != "Running" for a in snapshot.agent_pods)
 
+        # Build workload resource lookup for CONFIG/OTHER validation
+        # Maps "ns/workload_name" → {mem_request, mem_limit, cpu_request, cpu_limit}
+        woop_resource_map: dict[str, dict] = {}
+        for w in snapshot.woop_workloads:
+            wl_key = f"{w.get('namespace', '')}/{w.get('workloadName', w.get('name', ''))}"
+            for c in w.get("containers", []):
+                res = c.get("resources", c.get("requests", {}))
+                woop_resource_map[wl_key] = {
+                    "mem_request": res.get("mem_request", res.get("requestMemMib", 0)),
+                    "mem_limit": res.get("mem_limit", res.get("limitMemMib", 0)),
+                    "cpu_request": res.get("cpu_request", res.get("requestCpuMillis", 0)),
+                    "cpu_limit": res.get("cpu_limit", res.get("limitCpuMillis", 0)),
+                }
+                break  # first container is representative enough
+
+        # Also index by short name for fuzzy matching
+        woop_resource_short: dict[str, dict] = {}
+        for key, val in woop_resource_map.items():
+            short = key.split("/")[-1] if "/" in key else key
+            woop_resource_short[short] = val
+
         # Validate each LLM finding
         validated = []
         dropped = 0
@@ -452,50 +538,152 @@ class Evaluator:
             keep = False
 
             if cat == FindingCategory.OOMKILL:
-                # Must match an actual OOMKilled pod
-                keep = (
-                    wl in oom_workloads
-                    or wl_name in oom_workloads
-                    or any(wl_name in ow for ow in oom_workloads)
-                    or len(snapshot.oomkilled_pods) > 0 and wl == "cluster-level"
-                )
+                # Must match a specific OOMKilled pod AND meet restart threshold
+                oom_threshold = self.config.thresholds.oomkill_critical_per_hour
+                matches = [o for o in snapshot.oomkilled_pods
+                           if wl_name in o.get("name", o.get("workload_name", ""))
+                           or wl == f"{o.get('namespace', '')}/{o.get('name', '')}"]
+                # Sum restarts across matching pods for this workload
+                total_restarts = sum(m.get("restart_count", 0) for m in matches)
+                if matches and total_restarts >= oom_threshold:
+                    keep = True
+                    finding.evidence = json.dumps(matches[0])
+                elif wl == "cluster-level":
+                    # cluster-level: keep only if total OOMKills meet threshold
+                    total_oom_restarts = sum(
+                        o.get("restart_count", 0) for o in snapshot.oomkilled_pods
+                    )
+                    if total_oom_restarts >= oom_threshold:
+                        keep = True
+                        finding.evidence = json.dumps(snapshot.oomkilled_pods[:5])
 
             elif cat == FindingCategory.MISMATCH:
-                keep = wl in mismatch_workloads or any(wl_name in m for m in mismatch_workloads)
+                # Must find matching evidence — no evidence = no alert
+                match = next((m for m in snapshot.recommendation_mismatches
+                              if m.get("workload") == wl or wl_name in m.get("workload", "")), None)
+                if match:
+                    keep = True
+                    finding.evidence = json.dumps(match)
 
             elif cat == FindingCategory.ABSURD_RECOMMENDATION:
-                keep = wl in absurd_workloads or any(wl_name in a for a in absurd_workloads)
+                # Must find matching evidence — no evidence = no alert
+                match = next((a for a in snapshot.absurd_recommendations
+                              if a.get("workload") == wl or wl_name in a.get("workload", "")), None)
+                if match:
+                    keep = True
+                    finding.evidence = json.dumps(match)
 
             elif cat == FindingCategory.UNSCHEDULABLE:
-                keep = snapshot.pending_pods > 0
+                # Must confirm the SPECIFIC workload has pending pods, not just any pod on the cluster
+                matches = [p for p in snapshot.pending_pods_detail
+                           if wl_name in p.get("name", "")
+                           or wl == f"{p.get('namespace', '')}/{p.get('name', '')}"]
+                keep = len(matches) > 0
+                if keep:
+                    finding.evidence = json.dumps(matches[0])
 
             elif cat in (FindingCategory.AGENT, FindingCategory.AGENT_RESTART):
-                keep = (
-                    agent_not_running
-                    or snapshot.agent_restarts_last_hour > 0
-                    or any(wl_name in an for an in agent_names)
-                    or wl in ("cluster-level", "castai-system", "org-level")
-                )
+                if cat == FindingCategory.AGENT_RESTART:
+                    # Agent restart: require actual restarts
+                    keep = snapshot.agent_restarts_last_hour > 0
+                else:
+                    # Agent down: require a non-Running agent pod or no agent pods at all
+                    keep = agent_not_running or not snapshot.agent_pods
+                # Enrich with agent pod state
+                if keep and snapshot.agent_pods:
+                    finding.evidence = json.dumps({
+                        "agent_pods": snapshot.agent_pods,
+                        "restarts_last_hour": snapshot.agent_restarts_last_hour,
+                    })
 
             elif cat == FindingCategory.DATA_GAP:
-                keep = len(snapshot.data_gaps) > 0 or wl in data_gap_workloads
+                # Must match a specific workload with a data gap
+                match = next((d for d in snapshot.data_gaps
+                              if d.get("workload") == wl or wl_name in d.get("workload", "")), None)
+                if match:
+                    keep = True
+                    finding.evidence = json.dumps(match)
+                elif wl == "cluster-level" and snapshot.data_gaps:
+                    keep = True
+                    finding.evidence = json.dumps(snapshot.data_gaps[:5])
 
             elif cat == FindingCategory.MEMORY_LEAK:
-                # Trust the LLM if we have memory usage data at all
-                keep = len(snapshot.workload_memory_usage) > 0
+                # Must match a specific workload with memory usage data
+                matches = [m for m in snapshot.workload_memory_usage
+                           if wl_name in m.get("workload", "")
+                           or wl == f"{m.get('namespace', '')}/{m.get('workload', '')}"]
+                if matches:
+                    keep = True
+                    finding.evidence = json.dumps(matches[0])
+                elif wl == "cluster-level" and snapshot.workload_memory_usage:
+                    keep = True
+                    finding.evidence = json.dumps(snapshot.workload_memory_usage[:5])
 
             elif cat == FindingCategory.CASCADING_SCALING:
-                keep = True  # Validated by node/pod delta in raw metrics
+                # Only keep if actual node or pod count spiked >50%
+                keep = node_count_delta_pct > 50 or pod_count_delta_pct > 50
+                # Enrich with actual delta data
+                if keep:
+                    finding.evidence = json.dumps({
+                        "node_count": snapshot.node_count,
+                        "total_pods": snapshot.total_pods,
+                        "node_count_delta_pct": round(node_count_delta_pct, 1),
+                        "pod_count_delta_pct": round(pod_count_delta_pct, 1),
+                    })
 
             elif cat == FindingCategory.WEBHOOK_FAILURE:
                 keep = any(
                     s.get("signal") in ("webhook_exporter_failure", "wa_mutation_errors")
                     for s in snapshot.log_signals
                 )
+                # Enrich with matching log signals
+                if keep:
+                    signals = [s for s in snapshot.log_signals
+                               if s.get("signal") in ("webhook_exporter_failure", "wa_mutation_errors")]
+                    if signals:
+                        finding.evidence = json.dumps(signals)
 
-            elif cat in (FindingCategory.UNHEALTHY_DEPLOYMENT, FindingCategory.CONFIG, FindingCategory.OTHER):
-                # Generic categories — keep if any log signal or deployment issue exists
-                keep = True
+            elif cat == FindingCategory.UNHEALTHY_DEPLOYMENT:
+                # Must match a specific workload with crashlooping pods
+                matches = [p for p in snapshot.crashloop_pods_detail
+                           if wl_name in p.get("name", "")]
+                if matches:
+                    keep = True
+                    finding.evidence = json.dumps(matches[:5])
+                elif wl == "cluster-level" and snapshot.crashloop_pods_detail:
+                    keep = True
+                    finding.evidence = json.dumps(snapshot.crashloop_pods_detail[:5])
+
+            elif cat in (FindingCategory.CONFIG, FindingCategory.OTHER):
+                # Validate resource-specific claims against actual container specs.
+                # If the finding mentions a specific workload, verify it exists and
+                # that any resource ratio claims (e.g. "100x limit") are plausible.
+                res = woop_resource_map.get(wl) or woop_resource_short.get(wl_name)
+                if res:
+                    # Workload exists — check if the finding's claim is plausible
+                    what_lower = finding.what.lower()
+                    if "100x" in what_lower or "limit" in what_lower and "request" in what_lower:
+                        # Finding claims a specific limit:request ratio — verify
+                        mem_req = res.get("mem_request", 0)
+                        mem_lim = res.get("mem_limit", 0)
+                        if mem_req > 0 and mem_lim > 0:
+                            ratio = mem_lim / mem_req
+                            # Only keep if the ratio is actually extreme (>10x)
+                            keep = ratio > 10
+                            if not keep:
+                                logger.info(
+                                    "Dropped stale CONFIG finding for %s: actual ratio %.1fx (not 100x)",
+                                    wl, ratio,
+                                )
+                        else:
+                            keep = True  # can't verify, keep conservatively
+                    else:
+                        keep = True  # non-ratio claim, keep
+                elif wl in ("cluster-level", "org-level"):
+                    keep = True  # cluster-wide findings are OK
+                else:
+                    # Workload not found in snapshot at all — likely hallucinated
+                    keep = len(snapshot.log_signals) > 0  # keep only if we have some signals
 
             if keep:
                 validated.append(finding)
@@ -621,25 +809,17 @@ class Evaluator:
                 verdict = Verdict.WARNING
 
         # ── 1. OOMKill spiral ────────────────────────────────────────
-        if len(snapshot.oomkilled_pods) >= t.oomkill_critical_per_hour:
+        # Only alert if total restarts across OOMKilled pods meet threshold
+        total_oom_restarts = sum(o.get("restart_count", 0) for o in snapshot.oomkilled_pods)
+        if total_oom_restarts >= t.oomkill_critical_per_hour:
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,
                 category=FindingCategory.OOMKILL,
                 workload="cluster-level",
-                what=f"{len(snapshot.oomkilled_pods)} pods with OOMKill detected",
+                what=f"{len(snapshot.oomkilled_pods)} pods with OOMKill detected ({total_oom_restarts} total restarts)",
                 evidence=json.dumps(snapshot.oomkilled_pods[:3]),
                 suggested_action="Investigate OOMKill workloads immediately",
-            ))
-        elif len(snapshot.oomkilled_pods) > 0:
-            _escalate(Severity.WARNING)
-            findings.append(Finding(
-                severity=Severity.WARNING,
-                category=FindingCategory.OOMKILL,
-                workload="cluster-level",
-                what=f"{len(snapshot.oomkilled_pods)} OOMKill(s) — below critical threshold but rising",
-                evidence=json.dumps(snapshot.oomkilled_pods[:3]),
-                suggested_action="Monitor closely; check if count increases next cycle",
             ))
 
         # OOMKill escalating trend: 3+ consecutive snapshots with increasing OOM count
@@ -921,11 +1101,24 @@ class Evaluator:
         # ── Unhealthy deployments (from log_signals) ─────────────────
         for sig in snapshot.log_signals:
             if sig.get("signal") == "unhealthy_deployments":
-                _escalate(Severity.WARNING)
+                unhealthy_added = False
                 for dep in sig.get("sample", [])[:5]:
                     ns = dep.get("namespace", "")
                     name = dep.get("name", "")
                     desired = dep.get("desired", 0)
+                    # Skip scale-to-zero workloads — desired=0 means KEDA/HPA scaled down
+                    if desired == 0:
+                        continue
+                    # Verify workload actually has unhealthy pods in snapshot
+                    has_crashloop = any(
+                        name in p.get("name", "") for p in snapshot.crashloop_pods_detail
+                    )
+                    has_pending = any(
+                        name in p.get("name", "") for p in snapshot.pending_pods_detail
+                    )
+                    if not has_crashloop and not has_pending:
+                        continue
+                    unhealthy_added = True
                     findings.append(Finding(
                         severity=Severity.WARNING,
                         category=FindingCategory.UNHEALTHY_DEPLOYMENT,
@@ -934,16 +1127,18 @@ class Evaluator:
                         evidence=json.dumps(dep),
                         suggested_action="Check pod events and logs — may be CrashLoopBackOff or stuck Pending",
                     ))
-                remaining = sig.get("count", 0) - min(sig.get("count", 0), 5)
-                if remaining > 0:
-                    findings.append(Finding(
-                        severity=Severity.INFO,
-                        category=FindingCategory.UNHEALTHY_DEPLOYMENT,
-                        workload="cluster-level",
-                        what=f"+{remaining} more unhealthy deployment(s)",
-                        evidence=json.dumps(sig.get("sample", [])[5:8]),
-                        suggested_action="Review all unhealthy deployments in console",
-                    ))
+                if unhealthy_added:
+                    _escalate(Severity.WARNING)
+                    remaining = sig.get("count", 0) - min(sig.get("count", 0), 5)
+                    if remaining > 0:
+                        findings.append(Finding(
+                            severity=Severity.INFO,
+                            category=FindingCategory.UNHEALTHY_DEPLOYMENT,
+                            workload="cluster-level",
+                            what=f"+{remaining} more unhealthy deployment(s)",
+                            evidence=json.dumps(sig.get("sample", [])[5:8]),
+                            suggested_action="Review all unhealthy deployments in console",
+                        ))
 
         metrics = EvaluationMetrics(
             total_pods=snapshot.total_pods,
@@ -1003,8 +1198,11 @@ class Evaluator:
                 {},
             ),
             "recommendation_mismatches": snapshot.recommendation_mismatches[:10],
+            "recommendation_mismatches_total": snapshot.recommendation_mismatches_total,
             "absurd_recommendations": snapshot.absurd_recommendations[:10],
+            "absurd_recommendations_total": snapshot.absurd_recommendations_total,
             "data_gaps": snapshot.data_gaps[:10],
+            "data_gaps_total": snapshot.data_gaps_total,
             "mature_data_gaps": mature_data_gaps[:10],
             # Agent health
             "agent_pods": snapshot.agent_pods,

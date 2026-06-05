@@ -27,18 +27,65 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+def _is_token_expired(data: dict) -> bool:
+    """Check if a credential file contains an expired token.
+
+    Looks for common expiry fields: 'expires_at' (epoch), 'expiry' (ISO 8601).
+    Returns False (not expired) if no expiry field is found.
+    """
+    from datetime import datetime, timezone
+
+    expires_at = data.get("expires_at")
+    if isinstance(expires_at, (int, float)):
+        return datetime.now(timezone.utc).timestamp() > expires_at
+
+    expiry = data.get("expiry", data.get("expires"))
+    if isinstance(expiry, str):
+        try:
+            exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) > exp_dt
+        except ValueError:
+            pass
+
+    return False  # no expiry info — assume valid
+
+
 def _load_castai_credential(env_var: str, file_path: str, json_key: str) -> str:
-    """Load a credential from env var first, then fall back to ~/.castai/ file."""
+    """Load a credential from env var first, then fall back to ~/.castai/ files.
+
+    File resolution order:
+      1. env var (if set, used immediately)
+      2. ~/.castai/<file_path>  (e.g. credentials.json, iap_token.json)
+      3. ~/.castai/<prod-master variant>  (e.g. credentials-prod-master.json)
+
+    Falls through to the prod-master variant if the primary file is missing
+    or contains an expired token.
+    """
     val = os.getenv(env_var, "")
     if val:
         return val
-    p = Path.home() / ".castai" / file_path
-    if p.exists():
+
+    castai_dir = Path.home() / ".castai"
+
+    # Build fallback filename: credentials.json → credentials-prod-master.json
+    stem = Path(file_path).stem        # e.g. "credentials" or "iap_token"
+    suffix = Path(file_path).suffix    # e.g. ".json"
+    fallback_path = f"{stem}-prod-master{suffix}"
+
+    for candidate in [file_path, fallback_path]:
+        p = castai_dir / candidate
+        if not p.exists():
+            continue
         try:
             data = json.loads(p.read_text())
-            return data.get(json_key, "")
         except (json.JSONDecodeError, OSError):
-            pass
+            continue
+        if _is_token_expired(data):
+            continue  # expired — try next candidate
+        token = data.get(json_key, "")
+        if token:
+            return token
+
     return ""
 
 
@@ -49,6 +96,10 @@ class CastAIConfig:
     JWT and IAP tokens are auto-loaded from ~/.castai/ if env vars are not set:
       - ~/.castai/credentials.json  → "token" field → CASTAI_JWT_TOKEN
       - ~/.castai/iap_token.json    → "token" field → CASTAI_IAP_TOKEN
+
+    If the primary file is missing or contains an expired token, falls back to:
+      - ~/.castai/credentials-prod-master.json
+      - ~/.castai/iap_token-prod-master.json
     """
 
     api_url: str = field(default_factory=lambda: os.getenv("CASTAI_API_URL", "https://api.cast.ai"))
@@ -91,16 +142,16 @@ class SlackConfig:
 
     webhook_url: str = field(default_factory=lambda: os.getenv("SLACK_WEBHOOK_URL", ""))
     channel: str = field(default_factory=lambda: os.getenv("SLACK_CHANNEL", "#castai_grip_security_ext"))
-    dedup_window_minutes: int = 30
-    daily_summary_hour_utc: int = 8
+    dedup_window_minutes: int = field(default_factory=lambda: int(os.getenv("SLACK_DEDUP_MINUTES", "30")))
+    daily_summary_hour_utc: int = field(default_factory=lambda: int(os.getenv("SLACK_DAILY_SUMMARY_HOUR_UTC", "8")))
 
 
 @dataclass(frozen=True)
 class ClusterContext:
-    """Grip Security cluster-specific baseline context.
+    """Cluster-specific baseline context for false-positive reduction.
 
-    This is the critical section for false-positive reduction.
-    Must be tuned during the 24-hour dry-run period.
+    Configure via environment variables or override in code.
+    Must be tuned during the 24-hour dry-run period per cluster.
     """
 
     cluster_id: str = field(default_factory=lambda: os.getenv(
@@ -112,7 +163,9 @@ class ClusterContext:
         cid.strip() for cid in os.getenv("WATCHDOG_CLUSTER_IDS", "").split(",")
         if cid.strip()
     ])
-    cluster_name: str = "Grip Security prod-us-4"
+    cluster_name: str = field(default_factory=lambda: os.getenv(
+        "WATCHDOG_CLUSTER_NAME", ""
+    ))
     namespaces: list[str] = field(
         default_factory=lambda: [
             "cengage", "williamsmullen", "oscarhealth",
@@ -136,9 +189,11 @@ class Thresholds:
 
     # CRITICAL thresholds
     oomkill_critical_per_hour: int = 3
-    recommendation_mismatch_pct: float = 50.0
+    recommendation_mismatch_pct: float = 200.0
     absurd_memory_gib: float = 100.0
     absurd_cpu_cores: int = 100
+    mismatch_min_memory_gib: float = 1.0  # minimum absolute delta to flag mismatch
+    mismatch_min_cpu_cores: float = 2.0   # minimum absolute delta to flag mismatch
     pending_pod_minutes: int = 15
     agent_restart_critical_per_hour: int = 3
     agent_restart_count_critical: int = 5
