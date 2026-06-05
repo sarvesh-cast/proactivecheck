@@ -101,11 +101,9 @@ CRITICAL (post immediately):
 - Cluster node count or total pod count increased by >{node_spike_pct}% vs. the trailing 1-hour average without a corresponding deployment event (cascading scaling / runaway autoscaler).
 
 WARNING (post, but less urgent):
-- OOMKill count increasing but below critical threshold
 - Memory usage trending upward across {leak_snapshots}+ consecutive snapshots without leveling off (potential leak)
 - Workload with optimization enabled but no recommendation for >{data_gap_hours} hours
 - Node running at >{node_mem_pct}% memory utilization
-- CAST AI agent pod restartCount between 1-{agent_restart_critical} in the last hour
 - Workload autoscaler webhook not responding or exporter pod not Running
 - Any single pod memory usage exceeding {mem_over_request}x its request across 3+ snapshots (potential memory leak)
 
@@ -273,6 +271,9 @@ class Evaluator:
                             result, raw_result, snapshot,
                             node_count_delta_pct=node_count_delta_pct,
                             pod_count_delta_pct=pod_count_delta_pct,
+                            mature_pending_pods=mature_pending_pods or [],
+                            mature_data_gaps=mature_data_gaps or [],
+                            memory_leaks=memory_leaks or [],
                         )
                         return validated
                     # JSON parse failed — retry with same model before switching
@@ -479,6 +480,9 @@ class Evaluator:
         snapshot: SnapshotData,
         node_count_delta_pct: float = 0.0,
         pod_count_delta_pct: float = 0.0,
+        mature_pending_pods: list[dict] | None = None,
+        mature_data_gaps: list[dict] | None = None,
+        memory_leaks: list[dict] | None = None,
     ) -> EvaluationResult:
         """Cross-check LLM findings against raw snapshot data to eliminate hallucinations.
 
@@ -574,8 +578,10 @@ class Evaluator:
                     finding.evidence = json.dumps(match)
 
             elif cat == FindingCategory.UNSCHEDULABLE:
-                # Must confirm the SPECIFIC workload has pending pods, not just any pod on the cluster
-                matches = [p for p in snapshot.pending_pods_detail
+                # Only keep if the pod has been Pending beyond the maturity threshold (15 min).
+                # Fresh Pending pods are noise — they may schedule on the next cycle.
+                m_pending = mature_pending_pods or []
+                matches = [p for p in m_pending
                            if wl_name in p.get("name", "")
                            or wl == f"{p.get('namespace', '')}/{p.get('name', '')}"]
                 keep = len(matches) > 0
@@ -584,8 +590,8 @@ class Evaluator:
 
             elif cat in (FindingCategory.AGENT, FindingCategory.AGENT_RESTART):
                 if cat == FindingCategory.AGENT_RESTART:
-                    # Agent restart: require actual restarts
-                    keep = snapshot.agent_restarts_last_hour > 0
+                    # Agent restart loop: require ≥3 restarts/hr (matches critical threshold)
+                    keep = snapshot.agent_restarts_last_hour >= self.config.thresholds.agent_restart_critical_per_hour
                 else:
                     # Agent down: require a non-Running agent pod or no agent pods at all
                     keep = agent_not_running or not snapshot.agent_pods
@@ -597,31 +603,35 @@ class Evaluator:
                     })
 
             elif cat == FindingCategory.DATA_GAP:
-                # Must match a specific workload with a data gap
-                match = next((d for d in snapshot.data_gaps
+                # Only keep if the gap is mature (persisted >2h), matching fallback behavior.
+                # Fresh gaps (<2h) are INFO-only and handled by expansion from raw_result.
+                m_gaps = mature_data_gaps or []
+                match = next((d for d in m_gaps
                               if d.get("workload") == wl or wl_name in d.get("workload", "")), None)
                 if match:
                     keep = True
                     finding.evidence = json.dumps(match)
-                elif wl == "cluster-level" and snapshot.data_gaps:
+                elif wl == "cluster-level" and m_gaps:
                     keep = True
-                    finding.evidence = json.dumps(snapshot.data_gaps[:5])
+                    finding.evidence = json.dumps(m_gaps[:5])
 
             elif cat == FindingCategory.MEMORY_LEAK:
-                # Must match a specific workload with memory usage data
-                matches = [m for m in snapshot.workload_memory_usage
+                # Only keep if the workload has a trend-detected memory leak
+                # (consecutive upward trend across snapshots), not just high current usage.
+                m_leaks = memory_leaks or []
+                matches = [m for m in m_leaks
                            if wl_name in m.get("workload", "")
                            or wl == f"{m.get('namespace', '')}/{m.get('workload', '')}"]
                 if matches:
                     keep = True
                     finding.evidence = json.dumps(matches[0])
-                elif wl == "cluster-level" and snapshot.workload_memory_usage:
+                elif wl == "cluster-level" and m_leaks:
                     keep = True
-                    finding.evidence = json.dumps(snapshot.workload_memory_usage[:5])
+                    finding.evidence = json.dumps(m_leaks[:5])
 
             elif cat == FindingCategory.CASCADING_SCALING:
-                # Only keep if actual node or pod count spiked >50%
-                keep = node_count_delta_pct > 50 or pod_count_delta_pct > 50
+                spike_pct = self.config.thresholds.node_count_spike_pct
+                keep = node_count_delta_pct > spike_pct or pod_count_delta_pct > spike_pct
                 # Enrich with actual delta data
                 if keep:
                     finding.evidence = json.dumps({
@@ -682,15 +692,15 @@ class Evaluator:
                 elif wl in ("cluster-level", "org-level"):
                     keep = True  # cluster-wide findings are OK
                 else:
-                    # Workload not found in snapshot at all — likely hallucinated
-                    keep = len(snapshot.log_signals) > 0  # keep only if we have some signals
+                    # Workload not found in snapshot at all — drop
+                    keep = False
 
             if keep:
                 validated.append(finding)
             else:
                 dropped += 1
                 logger.warning(
-                    "Dropped hallucinated finding: [%s] %s on %s — no supporting data in snapshot",
+                    "Dropped unconfirmed finding: [%s] %s on %s — no supporting data in snapshot",
                     finding.severity.value, finding.category.value, finding.workload,
                 )
 
@@ -770,7 +780,7 @@ class Evaluator:
         # Update summary if findings changed significantly
         summary = llm_result.summary
         if dropped > 0:
-            summary = f"[Validated: {dropped} hallucinated finding(s) removed] {summary}"
+            summary = f"[Validated: {dropped} unconfirmed finding(s) removed] {summary}"
 
         return EvaluationResult(
             verdict=verdict,
@@ -985,7 +995,7 @@ class Evaluator:
             ))
 
         # ── 8. Agent restart loop ────────────────────────────────────
-        if agent_restarts_last_hour > 3:
+        if agent_restarts_last_hour > t.agent_restart_critical_per_hour:
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,
@@ -995,20 +1005,11 @@ class Evaluator:
                 evidence=f"agent_restarts_delta={agent_restarts_last_hour}",
                 suggested_action="Check agent logs for crash loops or silent ExitCode:0 failures",
             ))
-        elif agent_restarts_last_hour > 0:
-            _escalate(Severity.WARNING)
-            findings.append(Finding(
-                severity=Severity.WARNING,
-                category=FindingCategory.AGENT_RESTART,
-                workload="castai-system",
-                what=f"CAST AI agent(s) restarted {agent_restarts_last_hour} time(s) in the last hour",
-                evidence=f"agent_restarts_delta={agent_restarts_last_hour}",
-                suggested_action="Monitor; >3/hour escalates to CRITICAL",
-            ))
+        # 1-2 restarts/hr is normal operational behavior — don't alert
 
         # ExitCode:0 with high restart count (silent failure pattern)
         for agent in snapshot.agent_pods:
-            if agent.get("exit_code_zero_history") and agent.get("restart_count", 0) > 5:
+            if agent.get("exit_code_zero_history") and agent.get("restart_count", 0) > t.agent_restart_count_critical:
                 _escalate(Severity.CRITICAL)
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
@@ -1043,7 +1044,7 @@ class Evaluator:
                 ))
 
         # ── 10. Cascading scaling (only on scale-UP, not consolidation) ──
-        if node_count_delta_pct > 50:
+        if node_count_delta_pct > t.node_count_spike_pct:
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,
@@ -1053,7 +1054,7 @@ class Evaluator:
                 evidence=f"node_count={snapshot.node_count}, delta_pct={node_count_delta_pct:.1f}%",
                 suggested_action="Check for runaway autoscaler or cascading scaling event",
             ))
-        if pod_count_delta_pct > 50:
+        if pod_count_delta_pct > t.node_count_spike_pct:
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,

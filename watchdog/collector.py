@@ -215,17 +215,28 @@ for pod in pods:
         running = running + 1
     elif phase == "Pending":
         pending = pending + 1
-        # Capture reason for pending
+        # Only record as unschedulable if PodScheduled is False.
+        # Pods that are scheduled but Pending for other reasons
+        # (ImagePullBackOff, init containers, etc.) are not unschedulable.
         conds = st.get("conditions", [])
+        is_unschedulable = False
         reason = ""
+        pod_scheduled_seen = False
         for c in conds:
-            if c.get("type") == "PodScheduled" and c.get("status") == "False":
-                reason = c.get("message", c.get("reason", ""))
-        pending_details.append({
-            "namespace": ns,
-            "name": name,
-            "reason": reason,
-        })
+            if c.get("type") == "PodScheduled":
+                pod_scheduled_seen = True
+                if c.get("status") == "False":
+                    is_unschedulable = True
+                    reason = c.get("message", c.get("reason", ""))
+        # No PodScheduled condition yet = just created, treat as potentially unschedulable
+        if not pod_scheduled_seen:
+            is_unschedulable = True
+        if is_unschedulable:
+            pending_details.append({
+                "namespace": ns,
+                "name": name,
+                "reason": reason,
+            })
 
     # Only track the castai-agent deployment in castai-agent namespace.
     # Pod names follow "deployment-name-replicaset-pod" pattern.
@@ -1284,7 +1295,22 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                 running += 1
             elif phase == "Pending":
                 pending += 1
-                pending_details.append({"namespace": ns, "name": name, "reason": ""})
+                # Fallback path has limited condition data; include all
+                # pending pods but mark reason as unknown so evaluator
+                # can cross-check later.
+                conds_raw = (item.get("status.conditions")
+                             or item.get("conditions") or [])
+                sched_false = False
+                sched_seen = False
+                pend_reason = ""
+                for cond in conds_raw:
+                    if isinstance(cond, dict) and cond.get("type") == "PodScheduled":
+                        sched_seen = True
+                        if cond.get("status") == "False":
+                            sched_false = True
+                            pend_reason = cond.get("message", cond.get("reason", ""))
+                if not sched_seen or sched_false:
+                    pending_details.append({"namespace": ns, "name": name, "reason": pend_reason})
 
             for cs in (item.get("status.containerStatuses") or
                         item.get("containerStatuses") or []):

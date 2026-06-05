@@ -840,6 +840,14 @@ class Notifier:
                     container = p.get("container", "-")
                     restarts = str(p.get("restart_count", "?"))
                     rows.append([f"{ns}/{name}", container, restarts])
+            elif isinstance(ev, dict) and ev:
+                # log_signal evidence: {namespace, name, desired, ...}
+                ns = ev.get("namespace", "")
+                name = ev.get("name", "")
+                label = f"{ns}/{name}" if ns and name else f.workload
+                desired = ev.get("desired", "?")
+                ready = ev.get("ready", ev.get("readyReplicas", "?"))
+                rows.append([label, f"desired={desired}", f"ready={ready}"])
             else:
                 rows.append([f.workload, "-", "?"])
             causes.append(f"• `{f.workload}`: {f.what}")

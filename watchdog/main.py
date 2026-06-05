@@ -237,8 +237,8 @@ class Watchdog:
             agent_restart_delta = self.state.compute_agent_restarts_last_hour()
             memory_leaks = self.state.detect_memory_leaks()
             # Suppress data_gap on cold start — need ≥3 snapshots to establish baseline
-            mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0) if len(history) >= 3 else []
-            mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
+            mature_data_gaps = self.state.get_mature_data_gaps(min_hours=self.config.thresholds.data_gap_hours) if len(history) >= 3 else []
+            mature_pending = self.state.get_mature_pending_pods(min_minutes=float(self.config.thresholds.pending_pod_minutes))
             oomkill_trend = self.state.get_oomkill_trend()
 
             result = await self.evaluator.evaluate(
@@ -324,8 +324,8 @@ class Watchdog:
                 pod_delta = self.state.compute_pod_count_delta_pct()
                 agent_restart_delta = self.state.compute_agent_restarts_last_hour()
                 memory_leaks = self.state.detect_memory_leaks()
-                mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0) if len(history) >= 3 else []
-                mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
+                mature_data_gaps = self.state.get_mature_data_gaps(min_hours=self.config.thresholds.data_gap_hours) if len(history) >= 3 else []
+                mature_pending = self.state.get_mature_pending_pods(min_minutes=float(self.config.thresholds.pending_pod_minutes))
                 oomkill_trend = self.state.get_oomkill_trend()
 
                 result = await self.evaluator.evaluate(
@@ -474,8 +474,8 @@ class Watchdog:
         pod_delta = self.state.compute_pod_count_delta_pct()
         agent_restart_delta = self.state.compute_agent_restarts_last_hour()
         memory_leaks = self.state.detect_memory_leaks()
-        mature_data_gaps = self.state.get_mature_data_gaps(min_hours=2.0) if len(history) >= 3 else []
-        mature_pending = self.state.get_mature_pending_pods(min_minutes=15.0)
+        mature_data_gaps = self.state.get_mature_data_gaps(min_hours=self.config.thresholds.data_gap_hours) if len(history) >= 3 else []
+        mature_pending = self.state.get_mature_pending_pods(min_minutes=float(self.config.thresholds.pending_pod_minutes))
         oomkill_trend = self.state.get_oomkill_trend()
 
         if raw_fallback:
