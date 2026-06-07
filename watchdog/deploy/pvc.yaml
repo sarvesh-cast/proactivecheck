@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: watchdog-state
+  namespace: watchdog
+  labels:
+    app.kubernetes.io/name: watchdog
+    app.kubernetes.io/part-of: grip-watchdog
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi

@@ -277,6 +277,91 @@ class StateManager:
                 continue
         return mature
 
+    # ── OOMKill delta computation ───────────────────────────────────
+
+    def compute_oomkill_deltas(self, current_oom: list[dict]) -> list[dict]:
+        """Compute per-pod OOMKill restart deltas using cross-snapshot comparison.
+
+        For snapshot-sourced entries, `restart_count` is the pod's lifetime
+        restartCount — not per-hour. This method compares against the previous
+        snapshot to compute actual restarts since last check.
+
+        For WOOP/API-sourced entries (source != "snapshot_lastState"),
+        `restart_count` is already time-windowed, so we pass it through unchanged.
+
+        Returns the same list with:
+        - `restart_count` replaced by the delta for snapshot-sourced entries
+        - `lifetime_restart_count` storing the original value
+        - `snapshot_interval_hours` storing the time between current and previous snapshot
+        """
+        prev = self.get_previous_snapshot()
+        if not prev:
+            # First snapshot — can't compute delta.
+            # For snapshot-sourced entries, keep restart_count as-is (best effort).
+            return current_oom
+
+        # Compute interval between current and previous snapshot
+        snaps = self._state["snapshots"]
+        current_ts_str = snaps[-1].get("timestamp", "")
+        prev_ts_str = prev.get("timestamp", "")
+        interval_hours = self._compute_interval_hours(current_ts_str, prev_ts_str)
+
+        # Build lookup: pod_key → restart_count from previous snapshot
+        prev_restarts: dict[str, int] = {}
+        for o in prev.get("oomkilled_pods", []):
+            if o.get("source") == "snapshot_lastState":
+                ns = o.get("namespace", "")
+                name = o.get("name", "")
+                key = f"{ns}/{name}"
+                prev_restarts[key] = o.get("restart_count", 0)
+
+        result = []
+        for o in current_oom:
+            if o.get("source") != "snapshot_lastState":
+                # WOOP/API-sourced — already time-windowed
+                result.append(o)
+                continue
+
+            ns = o.get("namespace", "")
+            name = o.get("name", "")
+            key = f"{ns}/{name}"
+            lifetime_count = o.get("restart_count", 0)
+
+            if key in prev_restarts:
+                # Pod was in previous snapshot — compute genuine delta
+                delta = max(0, lifetime_count - prev_restarts[key])
+                enriched = {
+                    **o,
+                    "restart_count": delta,
+                    "lifetime_restart_count": lifetime_count,
+                    "snapshot_interval_hours": interval_hours,
+                }
+            else:
+                # Pod is new to OOM tracking — can't compute delta.
+                # Do NOT set snapshot_interval_hours so evaluator falls
+                # through to the cold-start fallback (pod age < 1h gate).
+                enriched = {
+                    **o,
+                    "restart_count": lifetime_count,
+                    "lifetime_restart_count": lifetime_count,
+                }
+            result.append(enriched)
+
+        return result
+
+    @staticmethod
+    def _compute_interval_hours(current_ts: str, prev_ts: str) -> float | None:
+        """Compute hours between two ISO-8601 timestamps. Returns None on failure."""
+        if not current_ts or not prev_ts:
+            return None
+        try:
+            cur = datetime.fromisoformat(current_ts.replace("Z", "+00:00"))
+            prv = datetime.fromisoformat(prev_ts.replace("Z", "+00:00"))
+            delta = (cur - prv).total_seconds() / 3600.0
+            return max(delta, 0.01)  # floor at ~36 seconds
+        except (ValueError, TypeError):
+            return None
+
     # ── Data gap duration tracking ────────────────────────────────────
 
     def update_data_gaps(self, current_gaps: list[dict]) -> list[dict]:

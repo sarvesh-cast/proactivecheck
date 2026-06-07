@@ -61,8 +61,13 @@ watchdog/
 ### Install dependencies
 
 ```bash
-pip install httpx openai
+pip install -r watchdog/requirements.txt
 ```
+
+| Package | Used by | Purpose |
+|---------|---------|---------|
+| `httpx` | mcp_client, collector, notifier | Async HTTP for MCP JSON-RPC, CAST AI API, Slack webhooks |
+| `openai` | evaluator | OpenAI-compatible chat completions (any LLM endpoint) |
 
 ### Environment Variables
 
@@ -76,8 +81,9 @@ pip install httpx openai
 | `LLM_API_KEY` | No | LLM API key (falls back to `CASTAI_API_KEY`) |
 | `LLM_BASE_URL` | No | OpenAI-compatible endpoint (default: `https://llm.kimchi.dev/openai/v1`) |
 | `SLACK_WEBHOOK_URL` | Yes | Slack incoming webhook |
-| `WATCHDOG_CLUSTER_ID` | No | Target cluster UUID (default: Grip prod-us-4) |
-| `WATCHDOG_MODEL` | No | LLM model (default: `kimi-k2.6`) |
+| `WATCHDOG_CLUSTER_IDS` | No | Comma-separated cluster UUIDs (multi-cluster supported) |
+| `WATCHDOG_MODEL` | No | LLM model (default: `minimax-m2.7`) |
+| `WATCHDOG_FALLBACK_MODEL` | No | Fallback LLM model if primary fails |
 | `WATCHDOG_DRY_RUN` | No | `true` to evaluate without posting to Slack |
 | `WATCHDOG_STATE_FILE` | No | State file path (default: `watchdog_state.json`) |
 | `WATCHDOG_LOG_LEVEL` | No | `DEBUG` / `INFO` / `WARNING` |

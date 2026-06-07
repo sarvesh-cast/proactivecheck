@@ -129,14 +129,20 @@ class Collector:
         if self.snapshot_time:
             woop_fn = self._mcp_woop_backtest(snapshot)
             oom_fn = self._mcp_oom_summary_backtest(snapshot)
+            oom_events_fn = asyncio.sleep(0)  # no-op in backtest
+            config_events_fn = asyncio.sleep(0)
         else:
             woop_fn = self._mcp_woop_workloads(snapshot)
             oom_fn = self._mcp_oom_summary(snapshot)
+            oom_events_fn = self._mcp_oom_events(snapshot)
+            config_events_fn = self._mcp_config_change_events(snapshot)
 
         results = await asyncio.gather(
             self._mcp_snapshot_health(snapshot),
             woop_fn,
             oom_fn,
+            oom_events_fn,
+            config_events_fn,
             self._mcp_resource_ratios(snapshot),
             self._mcp_cluster_details(snapshot),
             self._mcp_loki_signals(snapshot),
@@ -146,6 +152,7 @@ class Collector:
 
         names = [
             "snapshot_health", "woop_workloads", "oom_summary",
+            "oom_events", "config_events",
             "resource_ratios", "cluster_details", "loki_signals",
             "org_agent_health",
         ]
@@ -166,7 +173,91 @@ class Collector:
                         f"snapshot_fallback: {type(e).__name__}: {e}"
                     )
 
+        # ── Post-collection enrichment ─────────────────────────────────
+        # All parallel calls are done; enrich entries with cross-source data.
+        self._enrich_oom_entries(snapshot)
+        self._enrich_data_gaps(snapshot)
+
+        # Drop ephemeral log signals that were only needed for enrichment.
+        # These are bulk dicts (rec_lookup can be 2000+ entries) that should
+        # not be persisted in rolling state snapshots.
+        ephemeral = {"woop_rec_lookup", "oom_events_1h", "woop_config_changes"}
+        snapshot.log_signals = [
+            s for s in snapshot.log_signals if s.get("signal") not in ephemeral
+        ]
+
         return snapshot
+
+    def _enrich_oom_entries(self, snapshot: SnapshotData) -> None:
+        """Enrich OOM entries with event counts and WOOP recommendations.
+
+        Called after all parallel collectors complete.  Adds:
+          - oom_events_1h: exact OOM event count from get_workload_events
+          - woop_rec_mem / woop_rec_cpu: WOOP recommendation (from rec_lookup)
+        All fields are additive — missing data leaves defaults.
+        """
+        # Extract oom_events_1h counts from log_signals
+        oom_counts: dict[str, int] = {}
+        for sig in snapshot.log_signals:
+            if sig.get("signal") == "oom_events_1h":
+                oom_counts = sig.get("counts", {})
+                break
+
+        # Extract rec_lookup from log_signals (populated by woop_analyze_with_code)
+        rec_lookup: dict[str, dict] = {}
+        for sig in snapshot.log_signals:
+            if sig.get("signal") == "woop_rec_lookup":
+                rec_lookup = sig.get("lookup", {})
+                break
+
+        if not oom_counts and not rec_lookup:
+            return
+
+        for o in snapshot.oomkilled_pods:
+            ns = o.get("namespace", "")
+            pod_name = o.get("name", "")
+            # Derive workload name from pod name for matching
+            parts = pod_name.rsplit("-", 2)
+            wl_name = parts[0] if len(parts) >= 3 else pod_name
+            wl_key = f"{ns}/{wl_name}"
+
+            # Also try exact name (for WOOP-sourced entries where name IS the workload)
+            exact_key = f"{ns}/{pod_name}"
+
+            # OOM event count enrichment
+            if oom_counts:
+                count = oom_counts.get(wl_key) or oom_counts.get(exact_key) or 0
+                if count > 0:
+                    o["oom_events_1h"] = count
+
+            # WOOP recommendation enrichment
+            if rec_lookup:
+                rec = rec_lookup.get(wl_key) or rec_lookup.get(exact_key)
+                if rec:
+                    o["woop_rec_mem"] = rec.get("rec_mem", "")
+                    o["woop_rec_cpu"] = rec.get("rec_cpu", "")
+
+    def _enrich_data_gaps(self, snapshot: SnapshotData) -> None:
+        """Enrich data gap entries with onboarding time from config change events.
+
+        Adds 'enabled_since' field so alerts distinguish recent onboarding
+        (warming up) from long-standing gaps (broken).
+        """
+        # Extract config change lookup from log_signals
+        enabled_since: dict[str, str] = {}
+        for sig in snapshot.log_signals:
+            if sig.get("signal") == "woop_config_changes":
+                enabled_since = sig.get("enabled_since", {})
+                break
+
+        if not enabled_since:
+            return
+
+        for gap in snapshot.data_gaps:
+            wl_key = gap.get("workload", "")
+            config_time = enabled_since.get(wl_key)
+            if config_time:
+                gap["enabled_since"] = config_time
 
     def _unwrap_snapshot_result(self, data: Any) -> dict:
         """Unwrap and validate analyze_snapshot_with_code response."""
@@ -247,6 +338,21 @@ for pod in pods:
         if dep_prefix == "castai-agent":
             is_agent = True
 
+    # Build container spec lookup for resource limits/requests
+    spec_containers = pod.get("spec", {}).get("containers", [])
+    container_res = {}
+    for sc in spec_containers:
+        sc_name = sc.get("name", "")
+        sc_res = sc.get("resources", {})
+        sc_lim = sc_res.get("limits", {})
+        sc_req = sc_res.get("requests", {})
+        container_res[sc_name] = {
+            "mem_limit": sc_lim.get("memory", ""),
+            "mem_request": sc_req.get("memory", ""),
+            "cpu_limit": sc_lim.get("cpu", ""),
+            "cpu_request": sc_req.get("cpu", ""),
+        }
+
     pod_restarts = 0
     exit0 = False
 
@@ -260,12 +366,18 @@ for pod in pods:
 
         if term.get("reason") == "OOMKilled":
             oom_time = term.get("finishedAt", "")
+            c_name = cs.get("name", "")
+            c_res = container_res.get(c_name, {})
+            pod_created = md.get("creationTimestamp", "")
             oomkilled.append({
                 "namespace": ns,
                 "name": name,
-                "container": cs.get("name", ""),
+                "container": c_name,
                 "restart_count": rc,
                 "last_oomkill_time": oom_time,
+                "pod_created_at": pod_created,
+                "mem_limit": c_res.get("mem_limit", ""),
+                "mem_request": c_res.get("mem_request", ""),
                 "source": "snapshot_lastState",
             })
         if wait.get("reason") == "CrashLoopBackOff":
@@ -457,6 +569,8 @@ workloads = get_workloads()
 mismatches = []
 absurd = []
 data_gaps = []
+data_gap_seen = set()
+rec_lookup = {{}}
 summary = {{"managed": 0, "read_only": 0, "undefined": 0, "total": len(workloads)}}
 
 for wl in workloads:
@@ -492,7 +606,13 @@ for wl in workloads:
     if skip:
         continue
 
+    # Jobs/CronJobs run to completion — no steady-state to optimize
+    wl_kind = wl.get("kind", "")
+    if wl_kind in ("Job", "CronJob"):
+        continue
+
     containers = wl.get("containers") or []
+    rec_status = wl.get("recommendationStatus", "")
 
     has_rec = False
     for ctr in containers:
@@ -503,9 +623,19 @@ for wl in workloads:
     pod_count = wl.get("podCount", 0) or 0
 
     if mgmt == "MANAGED" and not has_rec:
-        if pod_count > 0:
-            data_gaps.append({{"workload": wl_key, "woop": woop_tag,
-                              "reason": "MANAGED but no active recommendation"}})
+        if pod_count > 0 and wl_key not in data_gap_seen:
+            # STATUS_APPLIED/STATUS_WAITING with no recommendation data =
+            # lookback period hasn't completed yet.  Not a real data gap.
+            if rec_status in ("STATUS_APPLIED", "STATUS_WAITING"):
+                # Skip — recommendation is warming up (lookback in progress)
+                pass
+            else:
+                data_gap_seen.add(wl_key)
+                data_gaps.append({{"workload": wl_key, "woop": woop_tag,
+                                  "kind": wl_kind,
+                                  "pod_count": pod_count,
+                                  "rec_status": rec_status or "NONE",
+                                  "reason": "No active recommendation"}})
         continue
 
     # Only flag MANAGED workloads for mismatch/absurd — READ_ONLY are informational
@@ -528,6 +658,16 @@ for wl in workloads:
         rr = rec_data.get("requests") or {{}}
         rec_mem_gib = rr.get("memoryGib", 0) or 0
         rec_cpu_cores = rr.get("cpuCores", 0) or 0
+
+        # Store recommendation for OOM enrichment (first container wins)
+        if wl_key not in rec_lookup and (rec_mem_gib or rec_cpu_cores):
+            rec_lookup[wl_key] = {{
+                "rec_mem": rec_mem_gib,
+                "rec_cpu": rec_cpu_cores,
+                "applied_mem": act_mem_gib,
+                "applied_cpu": act_cpu_cores,
+                "apply_type": apply_type,
+            }}
 
         # Helper to format GiB/MiB
         def fmt_mem(gib):
@@ -583,22 +723,28 @@ for wl in workloads:
                            "limit_request_ratio": rec_ratio,
                            "reason": "Rec " + fmt_mem(rec_mem_gib) + " is " + str(rec_ratio) + "x the current request " + fmt_mem(act_mem_gib)}})
 
+        # Skip mismatch for workloads with 0 running pods — nothing to apply to
+        if pod_count <= 0:
+            continue
+
         # Mismatch — rec vs applied divergence (requires both % AND absolute delta)
         if act_mem_gib and rec_mem_gib:
-            pct = abs(rec_mem_gib - act_mem_gib) / rec_mem_gib * 100
+            pct = abs(rec_mem_gib - act_mem_gib) / act_mem_gib * 100
             abs_delta = abs(rec_mem_gib - act_mem_gib)
             if pct > MISMATCH_PCT and abs_delta >= MISMATCH_MIN_MEM_GIB:
                 mismatches.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                                   "apply_type": apply_type,
                                    "recommended_memory_gib": round(rec_mem_gib, 1),
                                    "actual_memory_gib": round(act_mem_gib, 1),
                                    "rec_display": fmt_mem(rec_mem_gib),
                                    "applied_display": fmt_mem(act_mem_gib),
                                    "diff_pct": round(pct, 1)}})
         if act_cpu_cores and rec_cpu_cores:
-            pct = abs(rec_cpu_cores - act_cpu_cores) / rec_cpu_cores * 100
+            pct = abs(rec_cpu_cores - act_cpu_cores) / act_cpu_cores * 100
             abs_delta = abs(rec_cpu_cores - act_cpu_cores)
             if pct > MISMATCH_PCT and abs_delta >= MISMATCH_MIN_CPU_CORES:
                 mismatches.append({{"workload": wl_key, "container": c_name, "woop": woop_tag,
+                                   "apply_type": apply_type,
                                    "recommended_cpu_cores": round(rec_cpu_cores, 1),
                                    "actual_cpu_cores": round(act_cpu_cores, 1),
                                    "rec_display": str(round(rec_cpu_cores, 2)) + " CPU",
@@ -610,6 +756,7 @@ result = {{
     "absurd": absurd,
     "data_gaps": data_gaps,
     "summary": summary,
+    "rec_lookup": rec_lookup,
 }}
 '''
 
@@ -660,6 +807,14 @@ result = {{
             "total": woop_summary.get("total", 0),
         })
 
+        # Store rec_lookup for OOM enrichment (joined in _enrich_oom_entries)
+        rec_lookup = data.get("rec_lookup", {})
+        if rec_lookup:
+            snapshot.log_signals.append({
+                "signal": "woop_rec_lookup",
+                "lookup": rec_lookup,
+            })
+
         logger.info(
             "WOOP (analyze_with_code): %d workloads (managed=%d, read_only=%d, "
             "undefined=%d), %d mismatches, %d absurd, %d data gaps",
@@ -691,31 +846,152 @@ result = {{
         # Replace any stale snapshot-derived OOM data with this.
         woop_oom = []
         for oom in oom_workloads:
+            oom_count = oom.get("oom_count", 0)
+            last_oom = oom.get("last_oom", "")
             woop_oom.append({
                 "namespace": oom.get("namespace", ""),
                 "name": oom.get("workload_name", ""),
-                "oom_count": oom.get("oom_count", 0),
+                "restart_count": oom_count,
+                "container": oom.get("container_name", ""),
+                "last_oomkill_time": last_oom,
+                "oom_count": oom_count,
                 "first_oom": oom.get("first_oom", ""),
-                "last_oom": oom.get("last_oom", ""),
+                "last_oom": last_oom,
                 "source": "woop_events",
             })
 
-        # Keep only snapshot OOM entries that are recent AND not duplicated
-        # by WOOP data. WOOP is authoritative for the time window.
-        woop_keys = {
-            f"{o['namespace']}/{o['name']}" for o in woop_oom
-        }
-        kept_snapshot = [
-            o for o in snapshot.oomkilled_pods
-            if o.get("source") == "snapshot_lastState"
-            and f"{o.get('namespace')}/{o.get('name')}" not in woop_keys
+        # Merge strategy: snapshot pods have richer data (container, timestamp,
+        # actual restart count). WOOP has authoritative oom_count but at workload
+        # level (no container/pod detail). Keep snapshot entries first, then add
+        # WOOP entries only for workloads not already covered by snapshot data.
+        # Match at workload level: snapshot pod names contain the workload name.
+        snapshot_workload_keys = set()
+        for o in snapshot.oomkilled_pods:
+            ns = o.get("namespace", "")
+            pod_name = o.get("name", "")
+            # Derive workload name from pod name (strip replicaset/pod hash suffix)
+            # e.g. alerts-service-5cf45448d9-xggdt → alerts-service
+            parts = pod_name.rsplit("-", 2)
+            wl_name = parts[0] if len(parts) >= 3 else pod_name
+            snapshot_workload_keys.add(f"{ns}/{wl_name}")
+
+        kept_woop = [
+            o for o in woop_oom
+            if f"{o['namespace']}/{o['name']}" not in snapshot_workload_keys
         ]
-        snapshot.oomkilled_pods = woop_oom + kept_snapshot
+        snapshot_count = len(snapshot.oomkilled_pods)
+        snapshot.oomkilled_pods = list(snapshot.oomkilled_pods) + kept_woop
 
         logger.info(
-            "OOM summary: %d from WOOP, %d recent from snapshot, %d total",
-            len(woop_oom), len(kept_snapshot), len(snapshot.oomkilled_pods),
+            "OOM summary: %d from WOOP, %d from snapshot, %d total",
+            len(woop_oom), snapshot_count, len(snapshot.oomkilled_pods),
         )
+
+    async def _mcp_oom_events(self, snapshot: SnapshotData) -> None:
+        """get_workload_events(OOM_KILL): authoritative, time-windowed OOM event counts.
+
+        Unlike snapshot lastState (shows only most recent OOM per container)
+        or restartCount deltas (approximation), this returns every individual
+        OOM event in the time window.  Stores a lookup on the snapshot so
+        post-collection enrichment can add oom_events_1h to each OOM entry.
+        """
+        now = datetime.now(timezone.utc)
+        args = {
+            "cluster_id_or_name": self.cluster_id,
+            "from_date": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to_date": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "event_types": "OOM_KILL",
+            "include_event_data": False,
+        }
+        if self.org_id:
+            args["organization_id"] = self.org_id
+
+        data = await self.mcp.call_tool("woop_get_workload_events", args)
+        if not data:
+            return
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        items = data.get("items") or data.get("events") or (data if isinstance(data, list) else [])
+
+        # Aggregate: count events per workload (namespace/name)
+        counts: dict[str, int] = {}
+        for event in items:
+            # Event may have top-level workload fields or nested workloads list
+            workloads = event.get("workloads", [])
+            if not workloads:
+                wl_ns = event.get("workloadNamespace", event.get("namespace", ""))
+                wl_name = event.get("workloadName", event.get("name", ""))
+                if wl_ns or wl_name:
+                    workloads = [{"namespace": wl_ns, "name": wl_name}]
+            for wl in workloads:
+                key = f"{wl.get('namespace', '')}/{wl.get('name', '')}"
+                counts[key] = counts.get(key, 0) + 1
+
+        # Store as log signal for post-collection enrichment
+        snapshot.log_signals.append({
+            "signal": "oom_events_1h",
+            "counts": counts,
+        })
+
+        logger.info(
+            "OOM events (1h): %d events across %d workloads",
+            sum(counts.values()), len(counts),
+        )
+
+    async def _mcp_config_change_events(self, snapshot: SnapshotData) -> None:
+        """get_workload_events(CONFIGURATION_CHANGEDV2): when workloads were onboarded.
+
+        Enriches data_gap entries with 'enabled_since' so alerts can distinguish
+        "enabled 30 min ago (warming up)" from "enabled 3 days ago (broken)".
+        Fetches config changes from the last 7 days — if a workload has no event,
+        it was enabled long ago.
+        """
+        now = datetime.now(timezone.utc)
+        args = {
+            "cluster_id_or_name": self.cluster_id,
+            "from_date": (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to_date": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "event_types": "CONFIGURATION_CHANGEDV2",
+            "include_event_data": False,
+        }
+        if self.org_id:
+            args["organization_id"] = self.org_id
+
+        data = await self.mcp.call_tool("woop_get_workload_events", args)
+        if not data:
+            return
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        items = data.get("items") or data.get("events") or (data if isinstance(data, list) else [])
+
+        # Build lookup: workload key → earliest config change (= onboarding time)
+        enabled_since: dict[str, str] = {}
+        for event in items:
+            event_time = event.get("occurredAt") or event.get("createdAt") or ""
+            workloads = event.get("workloads", [])
+            if not workloads:
+                wl_ns = event.get("workloadNamespace", event.get("namespace", ""))
+                wl_name = event.get("workloadName", event.get("name", ""))
+                if wl_ns or wl_name:
+                    workloads = [{"namespace": wl_ns, "name": wl_name}]
+            for wl in workloads:
+                key = f"{wl.get('namespace', '')}/{wl.get('name', '')}"
+                # Keep the most recent config change (latest onboarding/re-enable)
+                existing = enabled_since.get(key, "")
+                if event_time > existing:
+                    enabled_since[key] = event_time
+
+        if enabled_since:
+            snapshot.log_signals.append({
+                "signal": "woop_config_changes",
+                "enabled_since": enabled_since,
+            })
+            logger.info(
+                "Config change events (7d): %d workloads with recent config changes",
+                len(enabled_since),
+            )
 
     # ── Backtest-mode WOOP reconstruction ──────────────────────────────
 
@@ -755,6 +1031,7 @@ workloads = get_workloads()
 
 candidates = []
 data_gaps = []
+data_gap_seen = set()
 summary = {{"managed": 0, "read_only": 0, "undefined": 0, "total": len(workloads)}}
 
 for wl in workloads:
@@ -786,7 +1063,13 @@ for wl in workloads:
     if skip:
         continue
 
+    # Jobs/CronJobs run to completion — no steady-state to optimize
+    wl_kind = wl.get("kind", "")
+    if wl_kind in ("Job", "CronJob"):
+        continue
+
     containers = wl.get("containers") or []
+    rec_status = wl.get("recommendationStatus", "")
 
     has_rec = False
     for ctr in containers:
@@ -797,9 +1080,14 @@ for wl in workloads:
     pod_count = wl.get("podCount", 0) or 0
 
     if mgmt == "MANAGED" and not has_rec and not containers:
-        if pod_count > 0:
-            data_gaps.append({{"workload": wl_key, "woop": woop_tag,
-                              "reason": "MANAGED but no recommendation or containers"}})
+        if pod_count > 0 and wl_key not in data_gap_seen:
+            if rec_status not in ("STATUS_APPLIED", "STATUS_WAITING"):
+                data_gap_seen.add(wl_key)
+                data_gaps.append({{"workload": wl_key, "woop": woop_tag,
+                                  "kind": wl_kind,
+                                  "pod_count": pod_count,
+                                  "rec_status": rec_status or "NONE",
+                                  "reason": "No recommendation or containers"}})
         continue
 
     # Only screen MANAGED workloads — READ_ONLY are informational
@@ -982,7 +1270,7 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
 
                         # Mismatch checks (requires both % AND absolute delta)
                         if req_mem_gib and rec_mem_gib:
-                            pct = abs(rec_mem_gib - req_mem_gib) / rec_mem_gib * 100
+                            pct = abs(rec_mem_gib - req_mem_gib) / req_mem_gib * 100
                             abs_delta = abs(rec_mem_gib - req_mem_gib)
                             if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_memory_gib:
                                 mismatches.append({
@@ -994,7 +1282,7 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                                     "source": "woop_metrics_backtest",
                                 })
                         if req_cpu_cores and rec_cpu_cores:
-                            pct = abs(rec_cpu_cores - req_cpu_cores) / rec_cpu_cores * 100
+                            pct = abs(rec_cpu_cores - req_cpu_cores) / req_cpu_cores * 100
                             abs_delta = abs(rec_cpu_cores - req_cpu_cores)
                             if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_cpu_cores:
                                 mismatches.append({
@@ -1056,27 +1344,41 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
 
         woop_oom = []
         for oom in oom_workloads:
+            oom_count = oom.get("oom_count", 0)
+            last_oom = oom.get("last_oom", "")
             woop_oom.append({
                 "namespace": oom.get("namespace", ""),
                 "name": oom.get("workload_name", ""),
-                "oom_count": oom.get("oom_count", 0),
+                "restart_count": oom_count,
+                "container": "",
+                "last_oomkill_time": last_oom,
+                "oom_count": oom_count,
                 "first_oom": oom.get("first_oom", ""),
-                "last_oom": oom.get("last_oom", ""),
+                "last_oom": last_oom,
                 "source": "woop_events_backtest",
             })
 
-        woop_keys = {f"{o['namespace']}/{o['name']}" for o in woop_oom}
-        kept_snapshot = [
-            o for o in snapshot.oomkilled_pods
-            if o.get("source") == "snapshot_lastState"
-            and f"{o.get('namespace')}/{o.get('name')}" not in woop_keys
+        # Prefer snapshot entries (richer: container, timestamp, pod name).
+        # Only add WOOP entries for workloads not already in snapshot data.
+        snapshot_workload_keys = set()
+        for o in snapshot.oomkilled_pods:
+            ns = o.get("namespace", "")
+            pod_name = o.get("name", "")
+            parts = pod_name.rsplit("-", 2)
+            wl_name = parts[0] if len(parts) >= 3 else pod_name
+            snapshot_workload_keys.add(f"{ns}/{wl_name}")
+
+        kept_woop = [
+            o for o in woop_oom
+            if f"{o['namespace']}/{o['name']}" not in snapshot_workload_keys
         ]
-        snapshot.oomkilled_pods = woop_oom + kept_snapshot
+        snapshot_count = len(snapshot.oomkilled_pods)
+        snapshot.oomkilled_pods = list(snapshot.oomkilled_pods) + kept_woop
 
         logger.info(
             "BACKTEST OOM: %d from WOOP events, %d from snapshot, %d total "
             "(window: %s to %s)",
-            len(woop_oom), len(kept_snapshot), len(snapshot.oomkilled_pods),
+            len(woop_oom), snapshot_count, len(snapshot.oomkilled_pods),
             from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), self.snapshot_time,
         )
 
@@ -1266,44 +1568,43 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
             logger.info("Org health: %d clusters with agent not online", len(offline))
 
     async def _mcp_snapshot_fallback(self, snapshot: SnapshotData) -> None:
-        """extract_fields_from_all: fallback if analyze_snapshot_with_code fails.
+        """query_snapshot_pods: fallback if analyze_snapshot_with_code fails.
 
-        Extracts basic pod statuses without running arbitrary code.
+        Fetches pods via query_snapshot_pods (max 1000) and processes locally.
+        Less efficient than analyze_snapshot_with_code but doesn't require
+        RestrictedPython code execution on the server.
         """
-        data = await self.mcp.call_tool("extract_fields_from_all", {
-            "cluster_id_or_name": self.cluster_id,
-            "resource_kind": "pods",
-            "fields": ["metadata.namespace", "metadata.name",
-                        "status.phase", "status.containerStatuses"],
-        })
+        args = {"cluster_id_or_name": self.cluster_id, "max_results": 1000}
+        if self.snapshot_time:
+            args["snapshot_time"] = self.snapshot_time
+        data = await self.mcp.call_tool("query_snapshot_pods", args)
         if not data:
-            raise RuntimeError("extract_fields_from_all returned empty")
+            raise RuntimeError("query_snapshot_pods returned empty")
         if isinstance(data, str):
             data = json.loads(data)
 
-        items = data if isinstance(data, list) else data.get("items", [])
+        items = data if isinstance(data, list) else data.get("pods", data.get("items", []))
         running = pending = crashloop = 0
         oomkilled = []
         crashloop_details = []
         pending_details = []
 
         for item in items:
-            ns = item.get("metadata.namespace", item.get("namespace", ""))
-            name = item.get("metadata.name", item.get("name", ""))
-            phase = item.get("status.phase", item.get("phase", "Unknown"))
+            md = item.get("metadata", {})
+            st = item.get("status", {})
+            ns = md.get("namespace", "")
+            name = md.get("name", "")
+            phase = st.get("phase", "Unknown")
+
             if phase == "Running":
                 running += 1
             elif phase == "Pending":
                 pending += 1
-                # Fallback path has limited condition data; include all
-                # pending pods but mark reason as unknown so evaluator
-                # can cross-check later.
-                conds_raw = (item.get("status.conditions")
-                             or item.get("conditions") or [])
+                conds = st.get("conditions", [])
                 sched_false = False
                 sched_seen = False
                 pend_reason = ""
-                for cond in conds_raw:
+                for cond in conds:
                     if isinstance(cond, dict) and cond.get("type") == "PodScheduled":
                         sched_seen = True
                         if cond.get("status") == "False":
@@ -1312,8 +1613,7 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                 if not sched_seen or sched_false:
                     pending_details.append({"namespace": ns, "name": name, "reason": pend_reason})
 
-            for cs in (item.get("status.containerStatuses") or
-                        item.get("containerStatuses") or []):
+            for cs in st.get("containerStatuses", []):
                 if isinstance(cs, dict):
                     term = cs.get("lastState", {}).get("terminated", {})
                     if term.get("reason") == "OOMKilled":
@@ -1340,7 +1640,7 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
         snapshot.oomkilled_pods = oomkilled
 
         logger.info(
-            "Fallback: %d pods (%d OOM, %d Pending, %d CrashLoop)",
+            "Fallback (query_snapshot_pods): %d pods (%d OOM, %d Pending, %d CrashLoop)",
             len(items), len(oomkilled), pending, crashloop,
         )
 
@@ -1358,9 +1658,10 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                 self._api_cluster_details(client, snapshot),
                 self._api_woop_workloads(client, snapshot),
                 self._api_oom_events(client, snapshot),
+                self._api_erroring_workloads(client, snapshot),
                 return_exceptions=True,
             )
-            names = ["cluster_details", "woop_workloads", "oom_events"]
+            names = ["cluster_details", "woop_workloads", "oom_events", "erroring_workloads"]
             for name, result in zip(names, results):
                 if isinstance(result, Exception):
                     err = f"{name}: {type(result).__name__}: {result}"
@@ -1382,9 +1683,28 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
         if resp:
             snapshot.node_count = resp.get("nodeCount", 0) or resp.get("node_count", 0)
             agent_status = resp.get("agentStatus", "unknown")
+
+            # Detect stale agent heartbeat — agentSnapshotReceivedAt > 10 min ago
+            agent_phase = "Running" if agent_status in ("online", "connected") else agent_status
+            heartbeat_str = resp.get("agentSnapshotReceivedAt", "")
+            stale_minutes = 0.0
+            if heartbeat_str:
+                try:
+                    hb_time = datetime.fromisoformat(heartbeat_str.replace("Z", "+00:00"))
+                    stale_minutes = (datetime.now(timezone.utc) - hb_time).total_seconds() / 60
+                    if stale_minutes > 10:
+                        agent_phase = f"StaleHeartbeat ({stale_minutes:.0f}m)"
+                        snapshot.log_signals.append({
+                            "signal": "agent_stale_heartbeat",
+                            "last_heartbeat": heartbeat_str,
+                            "stale_minutes": round(stale_minutes, 1),
+                        })
+                except (ValueError, TypeError):
+                    pass
+
             snapshot.agent_pods = [{
                 "name": "castai-agent", "namespace": "castai-agent",
-                "phase": "Running" if agent_status in ("online", "connected") else agent_status,
+                "phase": agent_phase,
                 "restart_count": 0, "source": "public-api",
             }]
 
@@ -1401,13 +1721,14 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
 
         # Reuse the same mismatch/absurd logic
         mismatches, absurd, data_gaps = [], [], []
+        data_gap_seen: set[str] = set()
         woop_summary = {"managed": 0, "read_only": 0, "undefined": 0}
         t = self.config.thresholds
         known_s2z = self.config.cluster.known_scale_to_zero_workloads
 
         for wl in workloads:
-            wl_name = wl.get("workloadName", "unknown")
-            wl_ns = wl.get("workloadNamespace", "unknown")
+            wl_name = wl.get("workloadName") or wl.get("name") or "unknown"
+            wl_ns = wl.get("workloadNamespace") or wl.get("namespace") or "unknown"
             wl_key = f"{wl_ns}/{wl_name}"
 
             # Extract WOOP config from the correct nested path
@@ -1431,7 +1752,18 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
             if any(pat in wl_name for pat in known_s2z):
                 continue
 
+            # Jobs/CronJobs run to completion — no steady-state to optimize
+            wl_kind = wl.get("kind") or wl.get("workloadKind") or ""
+            if wl_kind in ("Job", "CronJob"):
+                continue
+
             containers = wl.get("containers", [])
+            # API returns recommendationStatus as {"type": "STATUS_APPLIED", ...}
+            raw_rec_status = wl.get("recommendationStatus", "")
+            rec_status = (
+                raw_rec_status.get("type", "") if isinstance(raw_rec_status, dict)
+                else str(raw_rec_status)
+            )
 
             # Check if any container has a recommendation
             has_rec = False
@@ -1443,11 +1775,17 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
             pod_count = wl.get("podCount", 0) or 0
 
             if mgmt == "MANAGED" and not has_rec:
-                if pod_count > 0:
-                    data_gaps.append({
-                        "workload": wl_key, "woop": woop_tag,
-                        "reason": "MANAGED but no active recommendation",
-                    })
+                if pod_count > 0 and wl_key not in data_gap_seen:
+                    # STATUS_APPLIED/STATUS_WAITING = lookback pending, not a real gap
+                    if rec_status not in ("STATUS_APPLIED", "STATUS_WAITING"):
+                        data_gap_seen.add(wl_key)
+                        data_gaps.append({
+                            "workload": wl_key, "woop": woop_tag,
+                            "kind": wl_kind,
+                            "pod_count": pod_count,
+                            "rec_status": rec_status or "NONE",
+                            "reason": "No active recommendation",
+                        })
                 continue
             # Only flag MANAGED workloads for mismatch/absurd
             if mgmt != "MANAGED":
@@ -1495,20 +1833,81 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                                   f"the current request {act_mem_gib:.1f} GiB",
                     })
 
+                # Skip mismatch for workloads with 0 running pods — no pods
+                # means recommendation can't be applied; mismatch is expected.
+                if pod_count <= 0:
+                    continue
+
                 if act_mem_gib and rec_mem_gib:
-                    pct = abs(rec_mem_gib - act_mem_gib) / rec_mem_gib * 100
+                    # Divide by actual (applied) so over-recommendations can exceed 100%
+                    pct = abs(rec_mem_gib - act_mem_gib) / act_mem_gib * 100
                     abs_delta = abs(rec_mem_gib - act_mem_gib)
                     if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_memory_gib:
                         mismatches.append({"workload": wl_key, "container": c_name,
-                                           "woop": woop_tag, "diff_pct": round(pct, 1)})
+                                           "woop": woop_tag, "diff_pct": round(pct, 1),
+                                           "pod_count": pod_count})
                 if act_cpu_cores and rec_cpu_cores:
-                    pct = abs(rec_cpu_cores - act_cpu_cores) / rec_cpu_cores * 100
+                    pct = abs(rec_cpu_cores - act_cpu_cores) / act_cpu_cores * 100
                     abs_delta = abs(rec_cpu_cores - act_cpu_cores)
                     if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_cpu_cores:
                         mismatches.append({"workload": wl_key, "container": c_name,
-                                           "woop": woop_tag, "diff_pct": round(pct, 1)})
+                                           "woop": woop_tag, "diff_pct": round(pct, 1),
+                                           "pod_count": pod_count})
 
-        snapshot.woop_workloads = workloads
+        # Populate workload_memory_usage for memory leak trend detection.
+        # In MCP mode this comes from _mcp_resource_ratios(); in API mode we
+        # extract memory request from each workload's first container.
+        mem_usage = []
+        for wl in workloads:
+            wl_ns = wl.get("workloadNamespace") or wl.get("namespace") or "unknown"
+            wl_name = wl.get("workloadName") or wl.get("name") or "unknown"
+            for ctr in wl.get("containers", []):
+                res = ctr.get("resources") or {}
+                req = res.get("requests") or {}
+                lim = res.get("limits") or {}
+                req_mem_gib = req.get("memoryGib", 0) or 0
+                lim_mem_gib = lim.get("memoryGib", 0) or 0
+                if req_mem_gib > 0:
+                    mem_usage.append({
+                        "namespace": wl_ns,
+                        "workload": wl_name,
+                        "container": ctr.get("containerName", ctr.get("name", "")),
+                        "request_mem_mib": round(req_mem_gib * 1024, 1),
+                        "limit_mem_mib": round(lim_mem_gib * 1024, 1),
+                    })
+                break  # first container only
+        snapshot.workload_memory_usage = mem_usage
+
+        # Sum podCount across all workloads as approximate total_pods
+        total_pods = sum(wl.get("podCount", 0) or 0 for wl in workloads)
+        if total_pods > 0:
+            snapshot.total_pods = total_pods
+
+        # Strip workloads to minimal footprint for downstream use.
+        # Evaluator only needs namespace + name + first container's resources
+        # for CONFIG/OTHER finding validation (woop_resource_map).
+        # Full workload blob is 9+ MB per cluster — stripped version < 200 KB.
+        stripped = []
+        for wl in workloads:
+            first_ctr = {}
+            for ctr in wl.get("containers", []):
+                res = ctr.get("resources") or {}
+                req = res.get("requests") or {}
+                lim = res.get("limits") or {}
+                first_ctr = {
+                    "name": ctr.get("containerName", ctr.get("name", "")),
+                    "resources": {
+                        "requests": req,
+                        "limits": lim,
+                    },
+                }
+                break  # first container only
+            stripped.append({
+                "namespace": wl.get("workloadNamespace", wl.get("namespace", "")),
+                "workloadName": wl.get("workloadName", wl.get("name", "")),
+                "containers": [first_ctr] if first_ctr else [],
+            })
+        snapshot.woop_workloads = stripped
         snapshot.recommendation_mismatches = mismatches
         snapshot.absurd_recommendations = absurd
         snapshot.data_gaps = data_gaps
@@ -1527,29 +1926,106 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
     async def _api_oom_events(
         self, client: httpx.AsyncClient, snapshot: SnapshotData
     ) -> None:
+        """Fetch OOM_KILL and STARTUP_FAILURE events from last hour."""
         now = datetime.now(timezone.utc)
-        events = await self._paginated_get(
+        from_time = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Fetch both event types concurrently
+        # API uses "type" param (not "eventTypes") with EVENT_TYPE_ prefix,
+        # and returns items under "items" key (not "events").
+        oom_task = self._paginated_get(
             client,
             f"/v1/workload-autoscaling/clusters/{self.cluster_id}/workload-events",
-            params={
-                "eventTypes": "OOM_KILL",
-                "fromDate": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "toDate": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-            items_key="events",
+            params={"type": "EVENT_TYPE_OOM_KILL",
+                    "fromDate": from_time, "toDate": to_time},
+            items_key="items",
         )
-        seen = {}
-        for event in events:
-            for wl in event.get("workloads", []):
-                key = f"{wl.get('workloadNamespace')}/{wl.get('workloadName')}"
-                if key not in seen:
-                    seen[key] = {"namespace": wl.get("workloadNamespace", ""),
-                                 "name": wl.get("workloadName", ""), "oom_count": 0}
-                seen[key]["oom_count"] += 1
+        startup_task = self._paginated_get(
+            client,
+            f"/v1/workload-autoscaling/clusters/{self.cluster_id}/workload-events",
+            params={"type": "EVENT_TYPE_STARTUP_FAILURE",
+                    "fromDate": from_time, "toDate": to_time},
+            items_key="items",
+        )
+        oom_events, startup_events = await asyncio.gather(
+            oom_task, startup_task, return_exceptions=True,
+        )
 
+        # Process OOM events
+        # Field names must match what evaluator reads: restart_count, container
+        seen = {}
+        if not isinstance(oom_events, Exception):
+            for event in oom_events:
+                event_time = event.get("occurredAt") or event.get("createdAt") or ""
+                for wl in event.get("workloads", []):
+                    wl_ns = wl.get("namespace", "")
+                    wl_name = wl.get("name", "")
+                    key = f"{wl_ns}/{wl_name}"
+                    if key not in seen:
+                        seen[key] = {
+                            "namespace": wl_ns,
+                            "name": wl_name,
+                            "restart_count": 0,
+                            "container": wl.get("containerName", ""),
+                            "last_oomkill_time": event_time,
+                            "source": "workload-events-api",
+                        }
+                    seen[key]["restart_count"] += 1
+                    # Keep the most recent event time
+                    if event_time > (seen[key].get("last_oomkill_time") or ""):
+                        seen[key]["last_oomkill_time"] = event_time
         snapshot.oomkilled_pods = sorted(
-            seen.values(), key=lambda x: x["oom_count"], reverse=True,
+            seen.values(), key=lambda x: x["restart_count"], reverse=True,
         )
+
+        # Process STARTUP_FAILURE events → log signal for evaluator
+        if not isinstance(startup_events, Exception) and startup_events:
+            startup_workloads = {}
+            for event in startup_events:
+                for wl in event.get("workloads", []):
+                    key = f"{wl.get('namespace', '')}/{wl.get('name', '')}"
+                    startup_workloads[key] = startup_workloads.get(key, 0) + 1
+            if startup_workloads:
+                snapshot.log_signals.append({
+                    "signal": "startup_failures",
+                    "workloads": [
+                        {"workload": k, "count": v}
+                        for k, v in sorted(startup_workloads.items(),
+                                           key=lambda x: x[1], reverse=True)
+                    ],
+                })
+
+    async def _api_erroring_workloads(
+        self, client: httpx.AsyncClient, snapshot: SnapshotData
+    ) -> None:
+        """Fetch workloads with errors — tiny response (~4 results).
+
+        Detects webhook failures, cluster-controller issues, and other
+        WOOP-reported errors without needing Loki logs.
+        """
+        resp = await self._api_get(
+            client,
+            f"/v1/workload-autoscaling/clusters/{self.cluster_id}/workloads",
+            params={"workloadHasError": "true", "page.limit": "50"},
+        )
+        if not resp:
+            return
+
+        erroring = resp.get("workloads", [])
+        if erroring:
+            errors = []
+            for wl in erroring:
+                wl_ns = wl.get("workloadNamespace") or wl.get("namespace") or ""
+                wl_name = wl.get("workloadName") or wl.get("name") or ""
+                wl_key = f"{wl_ns}/{wl_name}"
+                error_msg = wl.get("error", wl.get("errorMessage", "unknown error"))
+                errors.append({"workload": wl_key, "error": str(error_msg)[:200]})
+            snapshot.log_signals.append({
+                "signal": "woop_workload_errors",
+                "count": len(errors),
+                "workloads": errors[:20],  # cap at 20
+            })
 
     # ── HTTP helpers ──────────────────────────────────────────────────
 
@@ -1558,7 +2034,10 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
         params: dict | None = None,
     ) -> dict | list | None:
         url = f"{self.api_url}{path}"
-        if self.org_id:
+        # Only append organizationId when using JWT auth (cross-org).
+        # Customer API keys are already org-scoped; adding the param
+        # triggers a different auth path that rejects the key with 401.
+        if self.org_id and not self.config.castai.uses_api_key:
             params = params or {}
             params.setdefault("organizationId", self.org_id)
         try:

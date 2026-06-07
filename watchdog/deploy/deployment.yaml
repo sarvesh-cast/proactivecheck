@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watchdog
+  namespace: watchdog
+  labels:
+    app.kubernetes.io/name: watchdog
+    app.kubernetes.io/part-of: grip-watchdog
+spec:
+  replicas: 1
+  # Only one instance should run at a time (state file is not shared)
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchdog
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: watchdog
+        app.kubernetes.io/part-of: grip-watchdog
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: watchdog
+          image: grip-watchdog:latest  # REPLACE with your registry path
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          envFrom:
+            - configMapRef:
+                name: watchdog-config
+            - secretRef:
+                name: watchdog-secrets
+          volumeMounts:
+            - name: state
+              mountPath: /data
+          # Liveness: process is alive
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, time; s=os.stat('/data/watchdog_state.json'); assert time.time()-s.st_mtime < 900"
+            initialDelaySeconds: 60
+            periodSeconds: 300
+            failureThreshold: 2
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: watchdog-state

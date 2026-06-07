@@ -46,19 +46,8 @@ SEVERITY_EMOJI = {
 }
 
 # Human-readable one-liner for each finding category shown in Slack alerts
-CATEGORY_DESCRIPTION: dict[str, str] = {
-    FindingCategory.OOMKILL.value: "Pod killed for exceeding memory limit — restarting in a loop",
-    FindingCategory.MISMATCH.value: "WOOP recommendation differs from what the pod is actually running",
-    FindingCategory.UNSCHEDULABLE.value: "Pod stuck in Pending — not enough resources to schedule it",
-    FindingCategory.AGENT.value: "CAST AI agent pod is not running or heartbeat is stale",
-    FindingCategory.DATA_GAP.value: "Workload has optimization enabled but no active recommendation",
-    FindingCategory.MEMORY_LEAK.value: "Memory usage trending up across snapshots without stabilizing",
-    FindingCategory.ABSURD_RECOMMENDATION.value: "WOOP recommendation exceeds absolute cap (≥100 GiB) or is ≥10x the current request",
-    FindingCategory.AGENT_RESTART.value: "CAST AI agent pod is restart-looping (>3 restarts/hour)",
-    FindingCategory.WEBHOOK_FAILURE.value: "Workload autoscaler admission webhook is not responding",
-    FindingCategory.CASCADING_SCALING.value: "Rapid node/pod count spike (>50% in 30 min) without a matching deployment",
-    FindingCategory.UNHEALTHY_DEPLOYMENT.value: "Deployment has pods in CrashLoopBackOff or failing readiness",
-}
+# Static fallback — used only if _category_description() isn't called.
+CATEGORY_DESCRIPTION: dict[str, str] = {}
 
 
 class Notifier:
@@ -69,6 +58,60 @@ class Notifier:
         self.state = state
         self.webhook_url = config.slack.webhook_url
         self.dedup_minutes = config.slack.dedup_window_minutes
+        # Build config-aware descriptions so alerts explain the exact trigger condition
+        self._build_category_descriptions()
+
+    def _build_category_descriptions(self) -> None:
+        """Build alert descriptions that include the exact trigger condition."""
+        t = self.config.thresholds
+        self._cat_descs: dict[str, str] = {
+            FindingCategory.OOMKILL.value: (
+                f"Triggered when a pod is OOMKilled ≥{t.oomkill_critical_per_hour} times "
+                f"within the last hour"
+            ),
+            FindingCategory.MISMATCH.value: (
+                f"Triggered when WOOP recommendation differs from applied resources "
+                f"by >{t.recommendation_mismatch_pct:.0f}%"
+            ),
+            FindingCategory.UNSCHEDULABLE.value: (
+                f"Triggered when a pod is stuck in Pending for >{t.pending_pod_minutes} min"
+            ),
+            FindingCategory.AGENT.value: (
+                "Triggered when CAST AI agent pod is not Running or heartbeat is stale (>10 min)"
+            ),
+            FindingCategory.DATA_GAP.value: (
+                f"Triggered when a workload has optimization enabled but no recommendation "
+                f"for >{t.data_gap_hours}h"
+            ),
+            FindingCategory.MEMORY_LEAK.value: (
+                "Triggered when memory usage is monotonically increasing across "
+                "3+ consecutive snapshots (>5% growth)"
+            ),
+            FindingCategory.ABSURD_RECOMMENDATION.value: (
+                f"Triggered when WOOP recommendation exceeds {t.absurd_memory_gib} GiB memory "
+                f"or {t.absurd_cpu_cores} CPU cores"
+            ),
+            FindingCategory.AGENT_RESTART.value: (
+                f"Triggered when CAST AI agent pod restarts "
+                f">{t.agent_restart_critical_per_hour} times/hour"
+            ),
+            FindingCategory.WEBHOOK_FAILURE.value: (
+                "Triggered when workload autoscaler admission webhook is not responding"
+            ),
+            FindingCategory.CASCADING_SCALING.value: (
+                "Triggered when node or pod count spikes >50% in 30 min "
+                "without a matching deployment change"
+            ),
+            FindingCategory.UNHEALTHY_DEPLOYMENT.value: (
+                "Triggered when a deployment has pods in CrashLoopBackOff or failing readiness"
+            ),
+        }
+        # Update the module-level dict for backward compatibility
+        CATEGORY_DESCRIPTION.update(self._cat_descs)
+
+    def _cat_desc(self, category: str) -> str:
+        """Get category description with trigger condition."""
+        return self._cat_descs.get(category, "")
 
     async def notify(self, result: EvaluationResult, dry_run: bool = False) -> None:
         """Process evaluation result and post to Slack if warranted.
@@ -415,11 +458,25 @@ class Notifier:
 
     @staticmethod
     def _fmt_ns_list(namespaces: list[str], limit: int = 5) -> str:
-        """Format namespace list with overflow."""
+        """Format namespace list with overflow (for mrkdwn outside code blocks)."""
         shown = namespaces[:limit]
         text = ", ".join(f"`{ns}`" for ns in shown)
         if len(namespaces) > limit:
             text += f" _+{len(namespaces) - limit} more_"
+        return text
+
+    @staticmethod
+    def _fmt_ns_col(namespaces: list[str], limit: int = 3) -> str:
+        """Format namespace list for a monospace table column.
+
+        Shows up to `limit` names comma-separated, with +N more overflow.
+        """
+        if not namespaces:
+            return "?"
+        shown = namespaces[:limit]
+        text = ", ".join(shown)
+        if len(namespaces) > limit:
+            text += f" +{len(namespaces) - limit}"
         return text
 
     def _format_woop_table(
@@ -495,25 +552,31 @@ class Notifier:
         groups = self._group_by_workload_name(items)
         rows = []
         for wl_name, group in list(groups.items())[:10]:
-            nss = [self._workload_ns(f.workload) for f, _ in group]
+            nss = sorted(set(self._workload_ns(f.workload) for f, _ in group))
+            ns_str = self._fmt_ns_col(nss)
             sample_ev = group[0][1]
             rec_d = sample_ev.get("rec_display", "?")
             app_d = sample_ev.get("applied_display", "?")
             woop = sample_ev.get("woop", "")
             rows.append([
                 wl_name,
-                str(len(nss)),
+                ns_str,
                 rec_d,
                 app_d,
                 woop,
             ])
         table = self._make_table(
-            ["Workload", "NS#", "Recommended", "Applied", "WOOP"],
+            ["Workload", "Namespace(s)", "Recommended", "Applied", "WOOP"],
             rows,
         )
         remaining = len(groups) - 10
         overflow = f"\n_+{remaining} more workload types_" if remaining > 0 else ""
-        return f"{header}{table}{overflow}\n_→ {items[0][0].suggested_action}_"
+        action = (
+            "→ Investigate why WOOP is generating an extreme recommendation. "
+            "Check if an outlier pod is driving this via the Max Usage strategy. "
+            "Consider setting a hard cap on recommendations for this workload."
+        )
+        return f"{header}{table}{overflow}\n_{action}_"
 
     def _render_ratio_breaches(
         self, sev_emoji: str, cluster: str,
@@ -528,7 +591,8 @@ class Notifier:
         groups = self._group_by_workload_name(items)
         rows = []
         for wl_name, group in list(groups.items())[:10]:
-            nss = [self._workload_ns(f.workload) for f, _ in group]
+            nss = sorted(set(self._workload_ns(f.workload) for f, _ in group))
+            ns_str = self._fmt_ns_col(nss)
             ratios = [ev.get("limit_request_ratio", 0) for _, ev in group]
             min_r, max_r = min(ratios), max(ratios)
             ratio_str = f"{min_r}x" if min_r == max_r else f"{min_r}-{max_r}x"
@@ -537,55 +601,72 @@ class Notifier:
             app_d = sample_ev.get("applied_display", "?")
             rows.append([
                 wl_name,
-                str(len(nss)),
+                ns_str,
                 rec_d,
                 app_d,
                 ratio_str,
             ])
         table = self._make_table(
-            ["Workload", "NS#", "Recommended", "Request", "Ratio"],
+            ["Workload", "Namespace(s)", "Recommended", "Request", "Ratio"],
             rows,
         )
         remaining = len(groups) - 10
         overflow = f"\n_+{remaining} more workload types_" if remaining > 0 else ""
-        return f"{header}{table}{overflow}\n_→ {items[0][0].suggested_action}_"
+        action = (
+            "→ A large ratio means WOOP thinks the workload needs much more than it currently requests. "
+            "Check workload metrics in CAST AI Console → WOOP → select the workload. "
+            "If the spike is from an outlier pod, consider switching from Max Usage to a percentile-based strategy."
+        )
+        return f"{header}{table}{overflow}\n_{action}_"
 
     def _render_mismatches(
         self, sev_emoji: str, cluster: str,
         items: list[tuple[Finding, dict]],
     ) -> str:
+        pct_thresh = self.config.thresholds.recommendation_mismatch_pct
         header = (
-            f"{sev_emoji} *Recommendation Mismatches* "
-            f"(>{self.config.thresholds.recommendation_mismatch_pct:.0f}% divergence) "
+            f"{sev_emoji} *Unapplied Recommendations* "
+            f"(>{pct_thresh:.0f}% gap) "
             f"— {len(items)} finding(s) on `{cluster}`"
-            f"\n_WOOP recommendation differs from what the pod is actually running_\n"
+            f"\n_WOOP computed new resource values but the pod is still running "
+            f"the old ones — rollout may be pending or stuck_\n"
         )
         groups = self._group_by_workload_name(items)
         rows = []
         for wl_name, group in list(groups.items())[:10]:
-            nss = [self._workload_ns(f.workload) for f, _ in group]
+            nss = sorted(set(self._workload_ns(f.workload) for f, _ in group))
+            ns_str = self._fmt_ns_col(nss)
             pcts = [ev.get("diff_pct", 0) for _, ev in group]
             min_p, max_p = min(pcts), max(pcts)
             pct_str = f"{min_p}%" if min_p == max_p else f"{min_p}-{max_p}%"
             sample_ev = group[0][1]
             rec_d = sample_ev.get("rec_display", "?")
             app_d = sample_ev.get("applied_display", "?")
-            woop = sample_ev.get("woop", "")
+            apply_type = sample_ev.get("apply_type", "")
+            apply_str = apply_type if apply_type else "-"
             rows.append([
                 wl_name,
-                str(len(nss)),
+                ns_str,
                 rec_d,
                 app_d,
                 pct_str,
-                woop,
+                apply_str,
             ])
         table = self._make_table(
-            ["Workload", "NS#", "Recommended", "Applied", "Diff%", "WOOP"],
+            ["Workload", "Namespace(s)", "Recommended", "Running", "Gap%", "Apply"],
             rows,
         )
         remaining = len(groups) - 10
         overflow = f"\n_+{remaining} more workload types_" if remaining > 0 else ""
-        return f"{header}{table}{overflow}\n_→ {items[0][0].suggested_action}_"
+        action = (
+            "→ *What this means:* WOOP has a new recommendation but the pod hasn't picked it up yet. "
+            "Common causes: rollout strategy is set to one-by-one and hasn't cycled this pod yet, "
+            "the workload has a PDB blocking restarts, or apply mode is paused.\n"
+            "→ *Action:* In CAST AI Console → WOOP → select the workload → check rollout status "
+            "and apply type. If IMMEDIATE, the pod should restart soon. If DEFERRED, the recommendation "
+            "applies on next natural restart."
+        )
+        return f"{header}{table}{overflow}\n{action}"
 
     # ── Per-category table renderers ────────────────────────────────
     # Each parses evidence JSON (enriched from snapshot in evaluator)
@@ -623,21 +704,48 @@ class Notifier:
             ev = self._parse_evidence(f)
             if isinstance(ev, list):
                 ev = ev[0] if ev else {}
-            restarts = str(ev.get("restart_count", "?"))
-            container = ev.get("container", "-")
-            last_oom = ev.get("last_oomkill_time", "")
-            if last_oom and len(last_oom) > 16:
-                last_oom = last_oom[:16]
+
+            # OOM rate: prefer _oom_rate_1h (computed by evaluator),
+            # then oom_events_1h (WOOP events API), then restart_count (raw)
+            oom_rate = ev.get("_oom_rate_1h")
+            oom_1h = ev.get("oom_events_1h")
+            if oom_rate is not None:
+                restarts = f"~{oom_rate}"
+            elif oom_1h is not None:
+                restarts = str(oom_1h)
+            else:
+                restarts = str(ev.get("restart_count", "?"))
+
+            # Memory limit from pod spec
+            mem_limit = ev.get("mem_limit", "")
+            # WOOP recommendation
+            woop_rec_mem = ev.get("woop_rec_mem")
+            if woop_rec_mem and isinstance(woop_rec_mem, (int, float)):
+                if woop_rec_mem >= 1.0:
+                    rec_str = f"{round(woop_rec_mem, 1)} GiB"
+                else:
+                    rec_str = f"{round(woop_rec_mem * 1024)} MiB"
+            else:
+                rec_str = ""
+
+            # Build context column: "limit 128Mi → rec 512 MiB"
+            context_parts = []
+            if mem_limit:
+                context_parts.append(f"limit {mem_limit}")
+            if rec_str:
+                context_parts.append(f"rec {rec_str}")
+            context = " → ".join(context_parts) if context_parts else "-"
+
             rows.append([
                 f.workload,
-                container,
+                ev.get("container", "-"),
                 restarts,
-                last_oom or "-",
+                context,
             ])
             causes.append(f"• `{f.workload}`: {f.what}")
 
         table = self._make_table(
-            ["Workload", "Container", "Restarts", "Last OOM"],
+            ["Workload", "Container", "OOMs/1h", "Limit → Rec"],
             rows,
         )
         if len(findings) > 15:
@@ -718,29 +826,37 @@ class Notifier:
             f"_{desc}_\n"
         )
         rows = []
-        causes = []
+        seen_wl = set()
         for f in findings[:15]:
             ev = self._parse_evidence(f)
             if isinstance(ev, list):
-                for g in ev[:5]:
-                    wl = g.get("workload", f.workload)
-                    container = g.get("container", "-")
-                    woop = g.get("woop", "-")
-                    rows.append([wl, container, woop])
+                items = ev[:5]
             else:
-                wl = ev.get("workload", f.workload)
-                container = ev.get("container", "-")
-                woop = ev.get("woop", "-")
-                rows.append([wl, container, woop])
-            causes.append(f"• `{f.workload}`: {f.what}")
+                items = [ev]
+            for g in items:
+                wl = g.get("workload", f.workload)
+                if wl in seen_wl:
+                    continue
+                seen_wl.add(wl)
+                kind = g.get("kind", "-")
+                pods = str(g.get("pod_count", "-"))
+                rec_st = g.get("rec_status", "-")
+                # Clean up STATUS_ prefix for readability
+                if isinstance(rec_st, str) and rec_st.startswith("STATUS_"):
+                    rec_st = rec_st[7:]  # e.g. STATUS_NO_RECOMMENDATION → NO_RECOMMENDATION
+                age = g.get("age_hours")
+                age_str = f"{age}h" if age else "new"
+                # Show when WOOP was enabled for this workload
+                enabled = g.get("enabled_since", "")
+                if enabled and len(enabled) > 10:
+                    enabled = enabled[:10]  # just the date
+                enabled_str = enabled if enabled else ">7d"
+                rows.append([wl, kind, pods, rec_st, age_str, enabled_str])
 
-        table = self._make_table(["Workload", "Container", "WOOP"], rows)
+        table = self._make_table(["Workload", "Kind", "Pods", "Rec Status", "Age", "Enabled"], rows)
         if len(findings) > 15:
-            causes.append(f"_+{len(findings) - 15} more_")
-        cause_text = "\n".join(causes[:5])
-        if len(causes) > 5:
-            cause_text += f"\n_+{len(causes) - 5} more_"
-        return f"{header}{table}\n*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
+            table += f"\n_+{len(findings) - 15} more_"
+        return f"{header}{table}\n_→ {findings[0].suggested_action}_"
 
     def _render_memory_leak_table(
         self, sev_emoji: str, cluster: str, findings: list[Finding],

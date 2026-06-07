@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -260,23 +261,19 @@ class Evaluator:
             mature_pending_pods=mature_pending_pods or [],
         )
 
-        # Try primary model with retries, then fallback model with retries
+        # ── LLM provides summary only; raw metrics are the single source
+        # ── of truth for findings.  This eliminates the entire validate/
+        # ── expand/merge pipeline and all duplicate-finding risks.
+        llm_summary: str | None = None
+        llm_model: str | None = None
         for model in [self.model, self.fallback_model]:
-            for attempt in range(1, 4):  # 3 attempts per model
+            for attempt in range(1, 4):
                 try:
                     result = await self._call_llm(prompt, model)
                     if result:
-                        # Cross-check LLM findings against raw data
-                        validated = self._validate_llm_result(
-                            result, raw_result, snapshot,
-                            node_count_delta_pct=node_count_delta_pct,
-                            pod_count_delta_pct=pod_count_delta_pct,
-                            mature_pending_pods=mature_pending_pods or [],
-                            mature_data_gaps=mature_data_gaps or [],
-                            memory_leaks=memory_leaks or [],
-                        )
-                        return validated
-                    # JSON parse failed — retry with same model before switching
+                        llm_summary = result.summary
+                        llm_model = result.model_used
+                        break
                     if attempt < 3:
                         wait = 2 ** attempt
                         logger.warning(
@@ -295,9 +292,19 @@ class Evaluator:
                     else:
                         logger.warning("Model %s failed after 3 attempts: %s", model, e)
                     continue
+            if llm_summary:
+                break
 
-        # Both models failed — return raw metrics-only evaluation
-        logger.error("All LLM evaluations failed, producing raw metrics fallback")
+        if llm_summary:
+            raw_result.summary = llm_summary
+            raw_result.model_used = f"{llm_model}+raw_findings"
+            logger.info(
+                "Using LLM summary from %s with %d raw findings",
+                llm_model, len(raw_result.findings),
+            )
+        else:
+            logger.error("All LLM evaluations failed, using raw metrics summary")
+
         return raw_result
 
     async def _call_llm(
@@ -473,324 +480,6 @@ class Evaluator:
             raw_response=raw[:2000],  # truncate for storage
         )
 
-    def _validate_llm_result(
-        self,
-        llm_result: EvaluationResult,
-        raw_result: EvaluationResult,
-        snapshot: SnapshotData,
-        node_count_delta_pct: float = 0.0,
-        pod_count_delta_pct: float = 0.0,
-        mature_pending_pods: list[dict] | None = None,
-        mature_data_gaps: list[dict] | None = None,
-        memory_leaks: list[dict] | None = None,
-    ) -> EvaluationResult:
-        """Cross-check LLM findings against raw snapshot data to eliminate hallucinations.
-
-        For each LLM finding, verify that the underlying data supports it.
-        Then merge in any real findings from raw metrics that the LLM missed.
-        """
-        # Build lookup sets from actual snapshot data for fast validation
-        oom_workloads = set()
-        for o in snapshot.oomkilled_pods:
-            ns = o.get("namespace", "")
-            name = o.get("name", o.get("workload_name", ""))
-            if ns and name:
-                oom_workloads.add(f"{ns}/{name}")
-            # Also add partial matches (just the workload name)
-            if name:
-                oom_workloads.add(name)
-
-        mismatch_workloads = {m.get("workload", "") for m in snapshot.recommendation_mismatches}
-        absurd_workloads = {a.get("workload", "") for a in snapshot.absurd_recommendations}
-        data_gap_workloads = {d.get("workload", "") for d in snapshot.data_gaps}
-
-        agent_names = {a.get("name", "") for a in snapshot.agent_pods}
-        agent_not_running = any(a.get("phase") != "Running" for a in snapshot.agent_pods)
-
-        # Build workload resource lookup for CONFIG/OTHER validation
-        # Maps "ns/workload_name" → {mem_request, mem_limit, cpu_request, cpu_limit}
-        woop_resource_map: dict[str, dict] = {}
-        for w in snapshot.woop_workloads:
-            wl_key = f"{w.get('namespace', '')}/{w.get('workloadName', w.get('name', ''))}"
-            for c in w.get("containers", []):
-                res = c.get("resources", c.get("requests", {}))
-                woop_resource_map[wl_key] = {
-                    "mem_request": res.get("mem_request", res.get("requestMemMib", 0)),
-                    "mem_limit": res.get("mem_limit", res.get("limitMemMib", 0)),
-                    "cpu_request": res.get("cpu_request", res.get("requestCpuMillis", 0)),
-                    "cpu_limit": res.get("cpu_limit", res.get("limitCpuMillis", 0)),
-                }
-                break  # first container is representative enough
-
-        # Also index by short name for fuzzy matching
-        woop_resource_short: dict[str, dict] = {}
-        for key, val in woop_resource_map.items():
-            short = key.split("/")[-1] if "/" in key else key
-            woop_resource_short[short] = val
-
-        # Validate each LLM finding
-        validated = []
-        dropped = 0
-
-        for finding in llm_result.findings:
-            cat = finding.category
-            wl = finding.workload
-
-            # Extract the workload name (last segment after /)
-            wl_name = wl.split("/")[-1] if "/" in wl else wl
-
-            keep = False
-
-            if cat == FindingCategory.OOMKILL:
-                # Must match a specific OOMKilled pod AND meet restart threshold
-                oom_threshold = self.config.thresholds.oomkill_critical_per_hour
-                matches = [o for o in snapshot.oomkilled_pods
-                           if wl_name in o.get("name", o.get("workload_name", ""))
-                           or wl == f"{o.get('namespace', '')}/{o.get('name', '')}"]
-                # Sum restarts across matching pods for this workload
-                total_restarts = sum(m.get("restart_count", 0) for m in matches)
-                if matches and total_restarts >= oom_threshold:
-                    keep = True
-                    finding.evidence = json.dumps(matches[0])
-                elif wl == "cluster-level":
-                    # cluster-level: keep only if total OOMKills meet threshold
-                    total_oom_restarts = sum(
-                        o.get("restart_count", 0) for o in snapshot.oomkilled_pods
-                    )
-                    if total_oom_restarts >= oom_threshold:
-                        keep = True
-                        finding.evidence = json.dumps(snapshot.oomkilled_pods[:5])
-
-            elif cat == FindingCategory.MISMATCH:
-                # Must find matching evidence — no evidence = no alert
-                match = next((m for m in snapshot.recommendation_mismatches
-                              if m.get("workload") == wl or wl_name in m.get("workload", "")), None)
-                if match:
-                    keep = True
-                    finding.evidence = json.dumps(match)
-
-            elif cat == FindingCategory.ABSURD_RECOMMENDATION:
-                # Must find matching evidence — no evidence = no alert
-                match = next((a for a in snapshot.absurd_recommendations
-                              if a.get("workload") == wl or wl_name in a.get("workload", "")), None)
-                if match:
-                    keep = True
-                    finding.evidence = json.dumps(match)
-
-            elif cat == FindingCategory.UNSCHEDULABLE:
-                # Only keep if the pod has been Pending beyond the maturity threshold (15 min).
-                # Fresh Pending pods are noise — they may schedule on the next cycle.
-                m_pending = mature_pending_pods or []
-                matches = [p for p in m_pending
-                           if wl_name in p.get("name", "")
-                           or wl == f"{p.get('namespace', '')}/{p.get('name', '')}"]
-                keep = len(matches) > 0
-                if keep:
-                    finding.evidence = json.dumps(matches[0])
-
-            elif cat in (FindingCategory.AGENT, FindingCategory.AGENT_RESTART):
-                if cat == FindingCategory.AGENT_RESTART:
-                    # Agent restart loop: require ≥3 restarts/hr (matches critical threshold)
-                    keep = snapshot.agent_restarts_last_hour >= self.config.thresholds.agent_restart_critical_per_hour
-                else:
-                    # Agent down: require a non-Running agent pod or no agent pods at all
-                    keep = agent_not_running or not snapshot.agent_pods
-                # Enrich with agent pod state
-                if keep and snapshot.agent_pods:
-                    finding.evidence = json.dumps({
-                        "agent_pods": snapshot.agent_pods,
-                        "restarts_last_hour": snapshot.agent_restarts_last_hour,
-                    })
-
-            elif cat == FindingCategory.DATA_GAP:
-                # Only keep if the gap is mature (persisted >2h), matching fallback behavior.
-                # Fresh gaps (<2h) are INFO-only and handled by expansion from raw_result.
-                m_gaps = mature_data_gaps or []
-                match = next((d for d in m_gaps
-                              if d.get("workload") == wl or wl_name in d.get("workload", "")), None)
-                if match:
-                    keep = True
-                    finding.evidence = json.dumps(match)
-                elif wl == "cluster-level" and m_gaps:
-                    keep = True
-                    finding.evidence = json.dumps(m_gaps[:5])
-
-            elif cat == FindingCategory.MEMORY_LEAK:
-                # Only keep if the workload has a trend-detected memory leak
-                # (consecutive upward trend across snapshots), not just high current usage.
-                m_leaks = memory_leaks or []
-                matches = [m for m in m_leaks
-                           if wl_name in m.get("workload", "")
-                           or wl == f"{m.get('namespace', '')}/{m.get('workload', '')}"]
-                if matches:
-                    keep = True
-                    finding.evidence = json.dumps(matches[0])
-                elif wl == "cluster-level" and m_leaks:
-                    keep = True
-                    finding.evidence = json.dumps(m_leaks[:5])
-
-            elif cat == FindingCategory.CASCADING_SCALING:
-                spike_pct = self.config.thresholds.node_count_spike_pct
-                keep = node_count_delta_pct > spike_pct or pod_count_delta_pct > spike_pct
-                # Enrich with actual delta data
-                if keep:
-                    finding.evidence = json.dumps({
-                        "node_count": snapshot.node_count,
-                        "total_pods": snapshot.total_pods,
-                        "node_count_delta_pct": round(node_count_delta_pct, 1),
-                        "pod_count_delta_pct": round(pod_count_delta_pct, 1),
-                    })
-
-            elif cat == FindingCategory.WEBHOOK_FAILURE:
-                keep = any(
-                    s.get("signal") in ("webhook_exporter_failure", "wa_mutation_errors")
-                    for s in snapshot.log_signals
-                )
-                # Enrich with matching log signals
-                if keep:
-                    signals = [s for s in snapshot.log_signals
-                               if s.get("signal") in ("webhook_exporter_failure", "wa_mutation_errors")]
-                    if signals:
-                        finding.evidence = json.dumps(signals)
-
-            elif cat == FindingCategory.UNHEALTHY_DEPLOYMENT:
-                # Must match a specific workload with crashlooping pods
-                matches = [p for p in snapshot.crashloop_pods_detail
-                           if wl_name in p.get("name", "")]
-                if matches:
-                    keep = True
-                    finding.evidence = json.dumps(matches[:5])
-                elif wl == "cluster-level" and snapshot.crashloop_pods_detail:
-                    keep = True
-                    finding.evidence = json.dumps(snapshot.crashloop_pods_detail[:5])
-
-            elif cat in (FindingCategory.CONFIG, FindingCategory.OTHER):
-                # Validate resource-specific claims against actual container specs.
-                # If the finding mentions a specific workload, verify it exists and
-                # that any resource ratio claims (e.g. "100x limit") are plausible.
-                res = woop_resource_map.get(wl) or woop_resource_short.get(wl_name)
-                if res:
-                    # Workload exists — check if the finding's claim is plausible
-                    what_lower = finding.what.lower()
-                    if "100x" in what_lower or "limit" in what_lower and "request" in what_lower:
-                        # Finding claims a specific limit:request ratio — verify
-                        mem_req = res.get("mem_request", 0)
-                        mem_lim = res.get("mem_limit", 0)
-                        if mem_req > 0 and mem_lim > 0:
-                            ratio = mem_lim / mem_req
-                            # Only keep if the ratio is actually extreme (>10x)
-                            keep = ratio > 10
-                            if not keep:
-                                logger.info(
-                                    "Dropped stale CONFIG finding for %s: actual ratio %.1fx (not 100x)",
-                                    wl, ratio,
-                                )
-                        else:
-                            keep = True  # can't verify, keep conservatively
-                    else:
-                        keep = True  # non-ratio claim, keep
-                elif wl in ("cluster-level", "org-level"):
-                    keep = True  # cluster-wide findings are OK
-                else:
-                    # Workload not found in snapshot at all — drop
-                    keep = False
-
-            if keep:
-                validated.append(finding)
-            else:
-                dropped += 1
-                logger.warning(
-                    "Dropped unconfirmed finding: [%s] %s on %s — no supporting data in snapshot",
-                    finding.severity.value, finding.category.value, finding.workload,
-                )
-
-        # Replace grouped LLM findings with per-workload raw findings.
-        # When the LLM lumps N workloads into one cluster-level finding
-        # but the raw fallback has per-workload detail, prefer the raw detail.
-        _expandable = {
-            FindingCategory.DATA_GAP, FindingCategory.MISMATCH,
-            FindingCategory.ABSURD_RECOMMENDATION, FindingCategory.UNSCHEDULABLE,
-            FindingCategory.OOMKILL, FindingCategory.OTHER,
-        }
-        raw_by_cat: dict[str, list[Finding]] = {}
-        for rf in raw_result.findings:
-            raw_by_cat.setdefault(rf.category.value, []).append(rf)
-
-        # Build set of per-workload names from raw findings for comparison
-        raw_workloads_by_cat: dict[str, set[str]] = {}
-        for rf in raw_result.findings:
-            raw_workloads_by_cat.setdefault(rf.category.value, set()).add(rf.workload)
-
-        expanded = []
-        expanded_cats = set()
-        for f in validated:
-            # Check if this LLM finding is a grouped/summarized one
-            # (e.g. "multiple (10 workloads)") rather than per-workload
-            raw_wl_names = raw_workloads_by_cat.get(f.category.value, set())
-            is_grouped = (
-                f.category in _expandable
-                and f.category.value in raw_by_cat
-                and len(raw_by_cat[f.category.value]) > 1
-                and f.workload not in raw_wl_names
-                and (
-                    any(
-                        kw in f.workload.lower()
-                        for kw in ("cluster-level", "multiple", "workload")
-                    )
-                    or f.workload == "cluster-level"
-                )
-            )
-            if is_grouped and f.category.value not in expanded_cats:
-                # Replace with per-workload raw findings
-                expanded.extend(raw_by_cat[f.category.value])
-                expanded_cats.add(f.category.value)
-            else:
-                expanded.append(f)
-        validated = expanded
-
-        # Merge in raw-metrics findings the LLM missed entirely
-        llm_categories_workloads = {
-            (f.category.value, f.workload) for f in validated
-        }
-        merged_from_raw = 0
-        for raw_finding in raw_result.findings:
-            key = (raw_finding.category.value, raw_finding.workload)
-            if key not in llm_categories_workloads:
-                if raw_finding.workload == "cluster-level":
-                    if any(f.category == raw_finding.category for f in validated):
-                        continue
-                validated.append(raw_finding)
-                merged_from_raw += 1
-
-        if dropped or merged_from_raw:
-            logger.info(
-                "Validation: %d LLM findings kept, %d hallucinations dropped, %d raw findings merged",
-                len(validated) - merged_from_raw, dropped, merged_from_raw,
-            )
-
-        # Recompute verdict from validated findings
-        verdict = Verdict.HEALTHY
-        for f in validated:
-            if f.severity == Severity.CRITICAL:
-                verdict = Verdict.CRITICAL
-                break
-            if f.severity == Severity.WARNING:
-                verdict = Verdict.WARNING
-
-        # Update summary if findings changed significantly
-        summary = llm_result.summary
-        if dropped > 0:
-            summary = f"[Validated: {dropped} unconfirmed finding(s) removed] {summary}"
-
-        return EvaluationResult(
-            verdict=verdict,
-            summary=summary,
-            findings=validated,
-            metrics=llm_result.metrics,
-            model_used=f"{llm_result.model_used}+validated",
-            raw_response=llm_result.raw_response,
-        )
-
     def _raw_metrics_fallback(
         self,
         snapshot: SnapshotData,
@@ -819,18 +508,84 @@ class Evaluator:
                 verdict = Verdict.WARNING
 
         # ── 1. OOMKill spiral ────────────────────────────────────────
-        # Only alert if total restarts across OOMKilled pods meet threshold
-        total_oom_restarts = sum(o.get("restart_count", 0) for o in snapshot.oomkilled_pods)
-        if total_oom_restarts >= t.oomkill_critical_per_hour:
+        # Rate calculation priority:
+        #   1. oom_events_1h (WOOP events API — authoritative, already time-windowed)
+        #   2. delta / snapshot_interval_hours (cross-snapshot comparison from state.py)
+        #   3. restart_count / pod_age_hours (cold-start fallback, first snapshot only)
+        #
+        # Recency gate: regardless of computed rate, skip the pod if
+        # last_oomkill_time is >1h ago — the problem has stopped.
+        critical_oom = []
+        now_utc = datetime.now(timezone.utc)
+        for o in snapshot.oomkilled_pods:
+            # ── Recency gate ──────────────────────────────────────
+            last_oom_str = o.get("last_oomkill_time", "")
+            if last_oom_str:
+                try:
+                    last_oom = datetime.fromisoformat(last_oom_str.replace("Z", "+00:00"))
+                    age_hours = (now_utc - last_oom).total_seconds() / 3600.0
+                    if age_hours > 1.0:
+                        o["_oom_rate_1h"] = 0.0
+                        o["_oom_skipped"] = "stale"
+                        continue  # last OOM was >1h ago — not active
+                except (ValueError, TypeError):
+                    pass  # unparseable → don't gate, proceed to rate calc
+
+            # ── Rate calculation ──────────────────────────────────
+            oom_events = o.get("oom_events_1h")
+            if oom_events:
+                # Priority 1: WOOP events API (authoritative)
+                oom_rate = oom_events
+            else:
+                delta = o.get("restart_count", 0)
+                interval = o.get("snapshot_interval_hours")
+                if interval is not None and interval > 0:
+                    # Priority 2: cross-snapshot delta / interval
+                    oom_rate = delta / interval
+                else:
+                    # Priority 3: cold-start fallback (first snapshot, no previous).
+                    # Lifetime average is only reliable for young pods (< 1h).
+                    # For older pods, skip — accurate delta will be available
+                    # on the next run (5 min later).
+                    pod_age_hours = self._pod_age_hours(o.get("pod_created_at"))
+                    if pod_age_hours is not None and pod_age_hours <= 1.0:
+                        oom_rate = delta / max(pod_age_hours, 0.1)
+                    else:
+                        # Old pod on cold start — can't trust lifetime average
+                        o["_oom_rate_1h"] = 0.0
+                        o["_oom_skipped"] = "cold_start_old_pod"
+                        continue
+
+            # Minimum count gate: a single OOM restart is not a "spiral".
+            # Require at least 2 actual restarts before alerting, regardless
+            # of extrapolated rate.
+            raw_count = o.get("restart_count", 0)
+            if raw_count < 2:
+                o["_oom_rate_1h"] = round(oom_rate, 1)
+                o["_oom_skipped"] = "single_event"
+                continue
+
+            o["_oom_rate_1h"] = round(oom_rate, 1)
+            if oom_rate >= t.oomkill_critical_per_hour:
+                critical_oom.append(o)
+        if critical_oom:
             _escalate(Severity.CRITICAL)
-            findings.append(Finding(
-                severity=Severity.CRITICAL,
-                category=FindingCategory.OOMKILL,
-                workload="cluster-level",
-                what=f"{len(snapshot.oomkilled_pods)} pods with OOMKill detected ({total_oom_restarts} total restarts)",
-                evidence=json.dumps(snapshot.oomkilled_pods[:3]),
-                suggested_action="Investigate OOMKill workloads immediately",
-            ))
+            for oom_pod in critical_oom:
+                ns = oom_pod.get("namespace", "")
+                name = oom_pod.get("name", "unknown")
+                wl = f"{ns}/{name}" if ns else name
+                oom_rate = oom_pod.get("_oom_rate_1h", 0)
+                container = oom_pod.get("container", "")
+                mem_limit = oom_pod.get("mem_limit", "")
+                limit_info = f" (limit {mem_limit})" if mem_limit else ""
+                findings.append(Finding(
+                    severity=Severity.CRITICAL,
+                    category=FindingCategory.OOMKILL,
+                    workload=wl,
+                    what=f"OOMKilled ~{oom_rate}/h — container {container or 'unknown'}{limit_info}",
+                    evidence=json.dumps(oom_pod),
+                    suggested_action="Check memory limits and WOOP recommendation for this workload",
+                ))
 
         # OOMKill escalating trend: 3+ consecutive snapshots with increasing OOM count
         trend = oomkill_trend or []
@@ -902,7 +657,7 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
                     category=FindingCategory.AGENT,
-                    workload=f"castai-system/{agent.get('name', 'unknown')}",
+                    workload=f"castai-agent/{agent.get('name', 'unknown')}",
                     what=f"CAST AI agent pod not Running (phase={agent.get('phase')})",
                     evidence=json.dumps(agent),
                     suggested_action="Check agent pod logs and events immediately",
@@ -1000,7 +755,7 @@ class Evaluator:
             findings.append(Finding(
                 severity=Severity.CRITICAL,
                 category=FindingCategory.AGENT_RESTART,
-                workload="castai-system",
+                workload="castai-agent",
                 what=f"CAST AI agent(s) restarted {agent_restarts_last_hour} times in the last hour",
                 evidence=f"agent_restarts_delta={agent_restarts_last_hour}",
                 suggested_action="Check agent logs for crash loops or silent ExitCode:0 failures",
@@ -1014,7 +769,7 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
                     category=FindingCategory.AGENT_RESTART,
-                    workload=f"castai-system/{agent.get('name', 'unknown')}",
+                    workload=f"castai-agent/{agent.get('name', 'unknown')}",
                     what=f"Agent has ExitCode:0 history with {agent.get('restart_count', 0)} restarts — silent failure pattern",
                     evidence=json.dumps(agent),
                     suggested_action="Investigate immediately — this pattern caused multi-day outages before",
@@ -1027,7 +782,7 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.WARNING,
                     category=FindingCategory.WEBHOOK_FAILURE,
-                    workload="castai-system/workload-autoscaler",
+                    workload="castai-agent/workload-autoscaler",
                     what=f"{sig.get('count', 0)} webhook/exporter error(s) in last 15 min",
                     evidence=json.dumps(sig.get("sample", [])[:2]),
                     suggested_action="Check WA webhook and exporter health; recommendations may not be applied",
@@ -1037,7 +792,7 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.WARNING,
                     category=FindingCategory.WEBHOOK_FAILURE,
-                    workload="castai-system/workload-autoscaler",
+                    workload="castai-agent/workload-autoscaler",
                     what=f"{sig.get('count', 0)} WA mutation error(s) — possible overflow or webhook issue",
                     evidence=json.dumps(sig.get("sample", [])[:2]),
                     suggested_action="Check for integer overflow in recommendations or webhook connectivity",
@@ -1098,6 +853,61 @@ class Evaluator:
                 evidence=f"crashloop_pods={snapshot.crashloop_pods}",
                 suggested_action="Investigate CrashLooping pods — all replicas may be down",
             ))
+
+        # ── Stale agent heartbeat (from API path) ─────────────────────
+        # Only emit if the phase check above didn't already flag this agent.
+        # If agent_phase is "StaleHeartbeat (Xm)" the phase check already fires
+        # a CRITICAL finding — this block adds detail only when agent shows
+        # "online" but heartbeat is actually stale (edge case).
+        flagged_agents = {f.workload for f in findings if f.category == FindingCategory.AGENT}
+        for sig in snapshot.log_signals:
+            if sig.get("signal") == "agent_stale_heartbeat":
+                if "castai-agent/castai-agent" in flagged_agents:
+                    continue  # already flagged by phase check
+                stale_min = sig.get("stale_minutes", 0)
+                sev = Severity.CRITICAL if stale_min > 30 else Severity.WARNING
+                _escalate(sev)
+                findings.append(Finding(
+                    severity=sev,
+                    category=FindingCategory.AGENT,
+                    workload="castai-agent/castai-agent",
+                    what=f"Agent heartbeat stale for {stale_min:.0f} minutes",
+                    evidence=f"last_heartbeat={sig.get('last_heartbeat')}",
+                    suggested_action="Agent may be down or stuck — check castai-agent pod logs",
+                ))
+
+        # ── STARTUP_FAILURE events (from API path) ───────────────────
+        for sig in snapshot.log_signals:
+            if sig.get("signal") == "startup_failures":
+                for wl_info in sig.get("workloads", [])[:5]:
+                    wl_key = wl_info.get("workload", "unknown")
+                    count = wl_info.get("count", 0)
+                    _escalate(Severity.WARNING)
+                    findings.append(Finding(
+                        severity=Severity.WARNING,
+                        category=FindingCategory.UNHEALTHY_DEPLOYMENT,
+                        workload=wl_key,
+                        what=f"{count} STARTUP_FAILURE event(s) in last hour",
+                        evidence=json.dumps(wl_info),
+                        suggested_action="Container failing to start — check image, resources, and liveness probes",
+                    ))
+
+        # ── WOOP workload errors (webhook/controller failures) ───────
+        for sig in snapshot.log_signals:
+            if sig.get("signal") == "woop_workload_errors":
+                for wl_err in sig.get("workloads", [])[:5]:
+                    wl_key = wl_err.get("workload", "unknown")
+                    err_msg = wl_err.get("error", "unknown")
+                    sev = Severity.CRITICAL if "cluster-controller" in err_msg.lower() else Severity.WARNING
+                    _escalate(sev)
+                    findings.append(Finding(
+                        severity=sev,
+                        category=FindingCategory.WEBHOOK_FAILURE,
+                        workload=wl_key,
+                        what=f"WOOP reports error: {err_msg[:100]}",
+                        evidence=json.dumps(wl_err),
+                        suggested_action="Check cluster-controller and admission webhook health",
+                    ))
 
         # ── Unhealthy deployments (from log_signals) ─────────────────
         for sig in snapshot.log_signals:
@@ -1160,6 +970,21 @@ class Evaluator:
             metrics=metrics,
             model_used="raw_metrics_fallback",
         )
+
+    @staticmethod
+    def _pod_age_hours(created_at: str | None) -> float | None:
+        """Return pod age in hours from an ISO-8601 creationTimestamp.
+
+        Returns None if the timestamp is missing or unparseable.
+        """
+        if not created_at:
+            return None
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            age = datetime.now(timezone.utc) - created
+            return max(age.total_seconds() / 3600.0, 0.01)
+        except (ValueError, TypeError):
+            return None
 
     def _compact_snapshot(
         self, snapshot: SnapshotData, mature_data_gaps: list[dict],

@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: watchdog-config
+  namespace: watchdog
+  labels:
+    app.kubernetes.io/name: watchdog
+    app.kubernetes.io/part-of: grip-watchdog
+data:
+  # ── CAST AI ───────────────────────────────────────────────────
+  CASTAI_API_URL: "https://api.cast.ai"
+  CASTAI_ORG_ID: "a31775a4-dfd0-4645-b1af-2e2c2605bbed"
+  CASTAI_MCP_URL: "https://castai-mcp.prod-master.cast.ai"
+
+  # ── Clusters ──────────────────────────────────────────────────
+  # Comma-separated cluster IDs, or "auto" to discover all from org
+  WATCHDOG_CLUSTER_IDS: >-
+    9f0584ca-a9b3-40db-bfa8-bf05ab6ae349,
+    d3b400e6-0b72-45fb-87e6-f3ebd09d277c,
+    e9f502e2-46dd-49fb-9310-149d7d8ad0ba,
+    e05a1612-6f74-4bb9-9bb9-af9fa68eb328,
+    53d4d5b2-638b-4e33-9b38-8141cf09f4aa,
+    4e48ada8-9193-4832-bf79-4eaf086259f9,
+    83479dcd-da21-46ce-9bcd-e6e7019492a6
+
+  # ── LLM ───────────────────────────────────────────────────────
+  LLM_BASE_URL: "https://llm.kimchi.dev/openai/v1"
+  WATCHDOG_MODEL: "minimax-m2.7"
+
+  # ── Slack ─────────────────────────────────────────────────────
+  SLACK_CHANNEL: "#castai_grip_security_ext"
+  SLACK_DEDUP_MINUTES: "30"
+  SLACK_DAILY_SUMMARY_HOUR_UTC: "8"
+
+  # ── Watchdog behavior ─────────────────────────────────────────
+  WATCHDOG_STATE_FILE: "/data/watchdog_state.json"
+  WATCHDOG_DRY_RUN: "false"
+  WATCHDOG_LOG_LEVEL: "INFO"

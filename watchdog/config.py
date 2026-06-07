@@ -107,11 +107,21 @@ class CastAIConfig:
     jwt_token: str = field(default_factory=lambda: _load_castai_credential("CASTAI_JWT_TOKEN", "credentials.json", "token"))
     organization_id: str = field(default_factory=lambda: os.getenv("CASTAI_ORG_ID", ""))
     iap_token: str = field(default_factory=lambda: _load_castai_credential("CASTAI_IAP_TOKEN", "iap_token.json", "cookie_value"))
-    mcp_url: str = field(default_factory=lambda: os.getenv("CASTAI_MCP_URL", ""))
+    mcp_url: str = field(default_factory=lambda: os.getenv("CASTAI_MCP_URL", "").strip())
     request_timeout: int = 30  # seconds per API call
 
     @property
+    def uses_api_key(self) -> bool:
+        """True when auth falls back to a customer API key (org-scoped, no expiry)."""
+        return bool(self.api_key) and not self.mcp_url
+
+    @property
     def auth_headers(self) -> dict[str, str]:
+        # In API-only mode (no MCP URL), prefer the non-expiring API key.
+        # JWT tokens loaded from ~/.castai/ may be expired; the file-level
+        # expiry check can't decode the JWT payload, so stale tokens slip through.
+        if self.uses_api_key:
+            return {"X-API-Key": self.api_key}
         if self.jwt_token:
             return {"Authorization": f"Bearer {self.jwt_token}"}
         if self.api_key:

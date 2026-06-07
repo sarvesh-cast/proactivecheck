@@ -34,46 +34,74 @@ _RETRYABLE_STATUS = {502, 503, 504, 429}
 logger = logging.getLogger("watchdog.mcp_client")
 
 # Token file locations (created by browser_login.py)
+# Resolution order: primary file → prod-master variant (skip expired tokens)
 CASTAI_DIR = Path.home() / ".castai"
-JWT_FILE = CASTAI_DIR / "credentials.json"
-IAP_FILE = CASTAI_DIR / "iap_token.json"
+JWT_FILES = [
+    CASTAI_DIR / "credentials.json",
+    CASTAI_DIR / "credentials-prod-master.json",
+]
+IAP_FILES = [
+    CASTAI_DIR / "iap_token.json",
+    CASTAI_DIR / "iap_token-prod-master.json",
+]
+
+
+from .config import _is_token_expired  # reuse shared expiry logic
 
 
 def _load_jwt() -> str | None:
-    """Load JWT token from ~/.castai/credentials.json."""
-    if not JWT_FILE.exists():
-        return None
-    try:
-        data = json.loads(JWT_FILE.read_text())
-        return data.get("token") or data.get("jwt") or data.get("access_token")
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning("Failed to load JWT from %s: %s", JWT_FILE, e)
-        return None
+    """Load JWT token from ~/.castai/credentials*.json.
+
+    Tries credentials.json first, then credentials-prod-master.json.
+    Skips files that are missing, unreadable, or contain expired tokens.
+    """
+    for jwt_file in JWT_FILES:
+        if not jwt_file.exists():
+            continue
+        try:
+            data = json.loads(jwt_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load JWT from %s: %s", jwt_file, e)
+            continue
+        if _is_token_expired(data):
+            logger.debug("JWT in %s is expired, trying next", jwt_file.name)
+            continue
+        token = data.get("token") or data.get("jwt") or data.get("access_token")
+        if token:
+            logger.debug("Loaded JWT from %s", jwt_file.name)
+            return token
+    return None
 
 
 def _load_iap_token() -> tuple[str, str] | None:
-    """Load IAP cookie from ~/.castai/iap_token.json.
+    """Load IAP cookie from ~/.castai/iap_token*.json.
 
+    Tries iap_token.json first, then iap_token-prod-master.json.
     Returns (cookie_name, cookie_value) or None.
-    The file format from browser_login.py uses cookie_name/cookie_value keys.
     """
-    if not IAP_FILE.exists():
-        return None
-    try:
-        data = json.loads(IAP_FILE.read_text())
+    for iap_file in IAP_FILES:
+        if not iap_file.exists():
+            continue
+        try:
+            data = json.loads(iap_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load IAP token from %s: %s", iap_file, e)
+            continue
+        if _is_token_expired(data):
+            logger.debug("IAP token in %s is expired, trying next", iap_file.name)
+            continue
         # browser_login.py format: cookie_name + cookie_value
         name = data.get("cookie_name")
         value = data.get("cookie_value")
         if name and value:
+            logger.debug("Loaded IAP token from %s", iap_file.name)
             return (name, value)
         # Fallback: flat token field
         token = data.get("token") or data.get("iap_token")
         if token:
+            logger.debug("Loaded IAP token from %s (flat format)", iap_file.name)
             return ("GCP_IAP_AUTH_TOKEN", token)
-        return None
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning("Failed to load IAP token from %s: %s", IAP_FILE, e)
-        return None
+    return None
 
 
 class MCPClient:
@@ -285,11 +313,28 @@ class MCPClient:
         Retries transient errors (502/503/504/429/timeouts) with exponential backoff.
         """
         # Auto-inject organization_id for tools that accept it.
+        # Snapshot/loki tools use cluster_id_or_name for scoping and
+        # reject organization_id as an unexpected keyword argument.
         _NO_ORG_ID_TOOLS = {
             "analyze_snapshot_with_code",
+            "woop_analyze_with_code",
             "get_cluster_snapshot_summary",
             "extract_fields_from_all",
+            "extract_field_by_uid",
+            "query_snapshot_pods",
+            "query_snapshot_deployments",
+            "query_snapshot_nodes",
+            "get_snapshot_pods",
+            "get_snapshot_nodes",
+            "get_snapshot_deployments",
+            "list_cluster_snapshots",
             "loki_query",
+            "loki_list_labels",
+            "loki_list_label_values",
+            "get_logs_by_cluster_and_service",
+            "get_error_logs",
+            "search_logs",
+            "get_recent_logs",
         }
         if (self.organization_id
                 and "organization_id" not in arguments

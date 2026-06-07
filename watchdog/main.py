@@ -77,6 +77,39 @@ from .state import StateManager
 logger = logging.getLogger("watchdog")
 
 
+async def _fetch_cluster_name_map(config: WatchdogConfig) -> dict[str, str]:
+    """Fetch {cluster_id: cluster_name} from list_clusters.
+
+    Returns empty dict on failure so callers fall back gracefully.
+    """
+    if not config.castai.mcp_url:
+        return {}
+    from .mcp_client import MCPClient
+    mcp = MCPClient(
+        mcp_url=config.castai.mcp_url,
+        jwt_token=config.castai.jwt_token or None,
+        organization_id=config.castai.organization_id or None,
+    )
+    try:
+        await mcp.initialize()
+        call_args = {}
+        if config.castai.organization_id:
+            call_args["organization_id"] = config.castai.organization_id
+        data = await mcp.call_tool("list_clusters", call_args)
+        if isinstance(data, str):
+            data = json.loads(data)
+        if isinstance(data, dict) and "result" in data:
+            inner = data["result"]
+            if isinstance(inner, str):
+                inner = json.loads(inner)
+            data = inner
+        clusters = data if isinstance(data, list) else (data.get("clusters") or data.get("items") or [])
+        return {cl["id"]: cl.get("name", "") for cl in clusters if isinstance(cl, dict) and cl.get("id")}
+    except Exception as e:
+        logger.warning("Could not fetch cluster names: %s", e)
+        return {}
+
+
 async def _resolve_cluster_ids(config: WatchdogConfig) -> list[dict]:
     """Resolve the list of cluster IDs to monitor.
 
@@ -88,14 +121,20 @@ async def _resolve_cluster_ids(config: WatchdogConfig) -> list[dict]:
 
     "auto" discovers all clusters from the org via list_clusters MCP call.
     """
-    # Explicit comma-separated list takes priority
+    # Explicit comma-separated list takes priority.
+    # Resolve names via list_clusters so alerts show "prod-us-3", not "d3b400e6".
     ids = config.cluster.cluster_ids
     if ids:
-        return [{"id": cid, "name": ""} for cid in ids]
+        name_map = await _fetch_cluster_name_map(config)
+        return [{"id": cid, "name": name_map.get(cid, "")} for cid in ids]
 
     # Single cluster ID set — use it
     if config.cluster.cluster_id:
-        return [{"id": config.cluster.cluster_id, "name": config.cluster.cluster_name}]
+        name = config.cluster.cluster_name
+        if not name:
+            name_map = await _fetch_cluster_name_map(config)
+            name = name_map.get(config.cluster.cluster_id, "")
+        return [{"id": config.cluster.cluster_id, "name": name}]
 
     # Nothing set — auto-discover all clusters from org
     logger.info("No cluster IDs configured, discovering from org...")
@@ -224,6 +263,12 @@ class Watchdog:
 
         # Store snapshot in rolling window
         self.state.push_snapshot(snapshot.to_dict_compact())
+
+        # Compute per-interval OOMKill deltas (cross-snapshot comparison).
+        # Must run after push_snapshot so the previous snapshot is available.
+        snapshot.oomkilled_pods = self.state.compute_oomkill_deltas(
+            list(snapshot.oomkilled_pods)
+        )
 
         # Track durations (updates first_seen timestamps)
         self.state.update_data_gaps(snapshot.data_gaps)
@@ -647,11 +692,10 @@ async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
 
     for i, cl in enumerate(clusters):
         cid, cname = cl["id"], cl["name"]
-        cfg = _config_for_cluster(base_config, cid, cname) if is_multi else base_config
-        if not is_multi and cname:
-            # Single cluster — still set the name from discovery
-            from dataclasses import replace as _replace
-            cfg = _replace(cfg, cluster=_replace(cfg.cluster, cluster_name=cname))
+        # Always build per-cluster config so cluster_id is set correctly,
+        # even when WATCHDOG_CLUSTER_IDS contains a single entry (is_multi=False)
+        # and WATCHDOG_CLUSTER_ID (singular) is unset.
+        cfg = _config_for_cluster(base_config, cid, cname)
         if args.skip_notify:
             from dataclasses import replace as _replace
             cfg = _replace(cfg, dry_run=True)
