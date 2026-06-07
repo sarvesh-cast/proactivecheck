@@ -1,0 +1,15 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: watchdog
+  namespace: watchdog
+  labels:
+    app.kubernetes.io/name: watchdog
+    app.kubernetes.io/part-of: grip-watchdog
+spec:
+  # Single replica — allow disruption but ensure
+  # voluntary eviction waits for graceful shutdown
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchdog

@@ -4,3 +4,7 @@ metadata:
   name: watchdog
   labels:
     app.kubernetes.io/part-of: grip-watchdog
+    # Pod Security Standards — enforce restricted profile
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

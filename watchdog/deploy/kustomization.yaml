@@ -3,9 +3,15 @@ kind: Kustomization
 
 namespace: watchdog
 
+commonLabels:
+  app.kubernetes.io/part-of: grip-watchdog
+
 resources:
   - namespace.yaml
+  - serviceaccount.yaml
   - secret.yaml
   - configmap.yaml
   - pvc.yaml
+  - networkpolicy.yaml
   - deployment.yaml
+  - pdb.yaml

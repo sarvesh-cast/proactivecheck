@@ -27,8 +27,13 @@ data:
   LLM_BASE_URL: "https://llm.kimchi.dev/openai/v1"
   WATCHDOG_MODEL: "minimax-m2.7"
 
+  # ── Loki (required for MCP log_signals) ───────────────────────
+  # Leave empty if not using Loki — MCP path will skip log queries
+  LOKI_URL: ""
+  LOKI_DATASOURCE_UID: ""
+
   # ── Slack ─────────────────────────────────────────────────────
-  SLACK_CHANNEL: "#castai_grip_security_ext"
+  SLACK_CHANNEL: ""
   SLACK_DEDUP_MINUTES: "30"
   SLACK_DAILY_SUMMARY_HOUR_UTC: "8"
 
@@ -36,3 +41,4 @@ data:
   WATCHDOG_STATE_FILE: "/data/watchdog_state.json"
   WATCHDOG_DRY_RUN: "false"
   WATCHDOG_LOG_LEVEL: "INFO"
+  WATCHDOG_RUN_INTERVAL: "300"

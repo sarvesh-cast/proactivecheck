@@ -5,10 +5,14 @@ metadata:
   namespace: watchdog
   labels:
     app.kubernetes.io/name: watchdog
+    app.kubernetes.io/component: monitor
     app.kubernetes.io/part-of: grip-watchdog
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    app.kubernetes.io/description: "CAST AI cluster health monitor — runs collect→evaluate→notify every 5 min"
 spec:
   replicas: 1
-  # Only one instance should run at a time (state file is not shared)
+  # Only one instance should run — state file is not shared
   strategy:
     type: Recreate
   selector:
@@ -18,13 +22,32 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: watchdog
+        app.kubernetes.io/component: monitor
         app.kubernetes.io/part-of: grip-watchdog
     spec:
+      serviceAccountName: watchdog
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
       containers:
         - name: watchdog
-          image: grip-watchdog:latest  # REPLACE with your registry path
+          image: grip-watchdog:latest  # REPLACE with your registry
           imagePullPolicy: Always
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
           resources:
             requests:
               cpu: 100m
@@ -32,25 +55,43 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+
           envFrom:
             - configMapRef:
                 name: watchdog-config
             - secretRef:
                 name: watchdog-secrets
+
           volumeMounts:
             - name: state
               mountPath: /data
-          # Liveness: process is alive
+            - name: tmp
+              mountPath: /tmp
+
+          # Startup: give the first cycle up to 10 min to complete
+          # (initial collect can be slow for large clusters)
+          startupProbe:
+            exec:
+              command: ["test", "-f", "/data/watchdog_state.json"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 36  # 30 + 36*10 = 390s max
+
+          # Liveness: state file must have been written in the last 15 min
+          # (cycle is 5 min, so 15 min = 3 missed cycles)
           livenessProbe:
             exec:
               command:
-                - python
+                - sh
                 - -c
-                - "import os, time; s=os.stat('/data/watchdog_state.json'); assert time.time()-s.st_mtime < 900"
-            initialDelaySeconds: 60
+                - "test $(( $(date +%s) - $(stat -c %Y /data/watchdog_state.json) )) -lt 900"
             periodSeconds: 300
             failureThreshold: 2
+
       volumes:
         - name: state
           persistentVolumeClaim:
             claimName: watchdog-state
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
