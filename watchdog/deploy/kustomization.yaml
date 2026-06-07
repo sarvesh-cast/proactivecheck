@@ -12,6 +12,5 @@ resources:
   - secret.yaml
   - configmap.yaml
   - pvc.yaml
-  - networkpolicy.yaml
   - deployment.yaml
   - pdb.yaml

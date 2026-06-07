@@ -69,6 +69,9 @@ class Notifier:
                 f"Triggered when a pod is OOMKilled ≥{t.oomkill_critical_per_hour} times "
                 f"within the last hour"
             ),
+            FindingCategory.CRASHLOOP.value: (
+                "Triggered when a pod is stuck in CrashLoopBackOff"
+            ),
             FindingCategory.MISMATCH.value: (
                 f"Triggered when WOOP recommendation differs from applied resources "
                 f"by >{t.recommendation_mismatch_pct:.0f}%"
@@ -153,7 +156,7 @@ class Notifier:
             return
 
         # Build and send the message
-        message = self._format_message(result.verdict, result.summary, new_findings)
+        message = self._format_message(result.verdict, result.summary, new_findings, result.evaluated_at)
 
         if dry_run:
             logger.info("[DRY RUN] Would post to Slack:\n%s", json.dumps(message, indent=2))
@@ -251,6 +254,7 @@ class Notifier:
         verdict: Verdict,
         summary: str,
         findings: list[Finding],
+        evaluated_at: str = "",
     ) -> dict:
         """Format findings into a compact Slack Block Kit message with tabular findings."""
         emoji = VERDICT_EMOJI[verdict]
@@ -258,10 +262,23 @@ class Notifier:
         console = self._console_link()
         cluster_label = self.config.cluster.cluster_name or self.config.cluster.cluster_id[:8]
 
+        # Format timestamp as short UTC time (e.g. "15:14 UTC")
+        ts_short = ""
+        if evaluated_at:
+            try:
+                dt = datetime.fromisoformat(evaluated_at.replace("Z", "+00:00"))
+                ts_short = dt.strftime("%H:%M UTC")
+            except (ValueError, AttributeError):
+                ts_short = ""
+
+        title = f"{emoji} {verdict.value} — {cluster_label}"
+        if ts_short:
+            title += f" · {ts_short}"
+
         blocks = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f"{emoji} {verdict.value} — {cluster_label}"},
+                "text": {"type": "plain_text", "text": title},
             },
             {
                 "type": "section",
@@ -276,17 +293,18 @@ class Notifier:
         _CATEGORY_ORDER = {
             # Critical-tier (appear first)
             FindingCategory.OOMKILL.value: 0,
-            FindingCategory.ABSURD_RECOMMENDATION.value: 1,
-            FindingCategory.MISMATCH.value: 2,
-            FindingCategory.CASCADING_SCALING.value: 3,
-            FindingCategory.AGENT.value: 4,
-            FindingCategory.AGENT_RESTART.value: 5,
-            FindingCategory.UNSCHEDULABLE.value: 6,
-            FindingCategory.WEBHOOK_FAILURE.value: 7,
+            FindingCategory.CRASHLOOP.value: 1,
+            FindingCategory.ABSURD_RECOMMENDATION.value: 2,
+            FindingCategory.MISMATCH.value: 3,
+            FindingCategory.CASCADING_SCALING.value: 4,
+            FindingCategory.AGENT.value: 5,
+            FindingCategory.AGENT_RESTART.value: 6,
+            FindingCategory.UNSCHEDULABLE.value: 7,
+            FindingCategory.WEBHOOK_FAILURE.value: 8,
             # Warning-tier
-            FindingCategory.UNHEALTHY_DEPLOYMENT.value: 8,
-            FindingCategory.MEMORY_LEAK.value: 9,
-            FindingCategory.DATA_GAP.value: 10,
+            FindingCategory.UNHEALTHY_DEPLOYMENT.value: 9,
+            FindingCategory.MEMORY_LEAK.value: 10,
+            FindingCategory.DATA_GAP.value: 11,
         }
         sorted_findings = sorted(
             [f for f in findings if f.severity != Severity.INFO],
@@ -325,6 +343,8 @@ class Notifier:
                 )
             elif cat_key == FindingCategory.OOMKILL.value:
                 rows.append(self._render_oomkill_table(sev_emoji, cluster_name, group_findings))
+            elif cat_key == FindingCategory.CRASHLOOP.value:
+                rows.append(self._render_crashloop_table(sev_emoji, cluster_name, group_findings))
             elif cat_key == FindingCategory.UNSCHEDULABLE.value:
                 rows.append(self._render_unschedulable_table(sev_emoji, cluster_name, group_findings))
             elif cat_key in (FindingCategory.AGENT.value, FindingCategory.AGENT_RESTART.value):
@@ -755,6 +775,29 @@ class Notifier:
             cause_text += f"\n_+{len(causes) - 5} more causes_"
         return f"{header}{table}\n*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
 
+    def _render_crashloop_table(
+        self, sev_emoji: str, cluster: str, findings: list[Finding],
+    ) -> str:
+        desc = CATEGORY_DESCRIPTION[FindingCategory.CRASHLOOP.value]
+        header = (
+            f"{sev_emoji} *CrashLoopBackOff* — {len(findings)} finding(s) on `{cluster}`\n"
+            f"_{desc}_\n"
+        )
+        rows = []
+        for f in findings[:15]:
+            ev = self._parse_evidence(f)
+            if isinstance(ev, dict) and ev:
+                container = ev.get("container", "-")
+                restarts = str(ev.get("restart_count", "?"))
+            else:
+                container = "-"
+                restarts = "?"
+            rows.append([f.workload, container, restarts])
+
+        table = self._make_table(["Workload", "Container", "Restarts"], rows)
+        extra = f"\n_+{len(findings) - 15} more_" if len(findings) > 15 else ""
+        return f"{header}{table}{extra}\n_→ {findings[0].suggested_action}_"
+
     def _render_unschedulable_table(
         self, sev_emoji: str, cluster: str, findings: list[Finding],
     ) -> str:
@@ -929,6 +972,10 @@ class Notifier:
                     signal = sig.get("signal", "?")
                     detail = sig.get("message", sig.get("detail", "-"))
                     rows.append([signal, str(detail)])
+            elif isinstance(ev, dict) and ev:
+                # WOOP workload error: {"workload": "...", "error": "..."}
+                detail = ev.get("error", ev.get("message", "-"))
+                rows.append([f.workload, str(detail)[:80]])
             else:
                 rows.append([f.workload, "-"])
             causes.append(f"• {f.what}")
@@ -949,26 +996,25 @@ class Notifier:
         causes = []
         for f in findings[:15]:
             ev = self._parse_evidence(f)
-            if isinstance(ev, list):
-                for p in ev[:5]:
-                    ns = p.get("namespace", "")
-                    name = p.get("name", "")
-                    container = p.get("container", "-")
-                    restarts = str(p.get("restart_count", "?"))
-                    rows.append([f"{ns}/{name}", container, restarts])
-            elif isinstance(ev, dict) and ev:
-                # log_signal evidence: {namespace, name, desired, ...}
+            if isinstance(ev, dict) and ev:
                 ns = ev.get("namespace", "")
                 name = ev.get("name", "")
                 label = f"{ns}/{name}" if ns and name else f.workload
                 desired = ev.get("desired", "?")
                 ready = ev.get("ready", ev.get("readyReplicas", "?"))
-                rows.append([label, f"desired={desired}", f"ready={ready}"])
+                avail = ev.get("available", ev.get("availableReplicas", "?"))
+                rows.append([label, str(desired), str(ready), str(avail)])
+            elif isinstance(ev, list):
+                for p in ev[:5]:
+                    ns = p.get("namespace", "")
+                    name = p.get("name", "")
+                    label = f"{ns}/{name}" if ns and name else f.workload
+                    rows.append([label, str(p.get("desired", "?")), str(p.get("ready", "?")), str(p.get("available", "?"))])
             else:
-                rows.append([f.workload, "-", "?"])
+                rows.append([f.workload, "?", "?", "?"])
             causes.append(f"• `{f.workload}`: {f.what}")
 
-        table = self._make_table(["Pod", "Container", "Restarts"], rows)
+        table = self._make_table(["Deployment", "Desired", "Ready", "Available"], rows)
         if len(findings) > 15:
             causes.append(f"_+{len(findings) - 15} more_")
         cause_text = "\n".join(causes[:5])
@@ -1027,3 +1073,124 @@ class Notifier:
             logger.error("Slack webhook timed out — will retry next cycle")
         except Exception as e:
             logger.error("Failed to post to Slack: %s", e)
+
+    # ── App execution failure alerts (admin channel) ─────────────
+
+    async def notify_app_error(
+        self,
+        phase: str,
+        error: Exception | str,
+        *,
+        cluster_id: str = "",
+        cluster_name: str = "",
+        context: str = "",
+        dry_run: bool = False,
+    ) -> None:
+        """Post an app execution failure to the admin Slack channel.
+
+        Called when the watchdog pipeline itself fails — collector crash,
+        evaluator exception, LLM unavailability, auth expiry, etc.
+        These go to a separate admin-only channel so operators see them
+        without cluttering the general findings channel.
+
+        Args:
+            phase: Pipeline phase that failed (e.g. "collector", "evaluator", "notifier")
+            error: The exception or error message
+            cluster_id: Cluster ID (for context)
+            cluster_name: Cluster name (for context)
+            context: Additional context string (optional)
+            dry_run: If True, log instead of posting
+        """
+        # Dedup admin alerts: same phase + cluster within dedup window
+        dedup_key = DedupKey(category=f"APP_ERROR_{phase.upper()}", workload=cluster_id or "global")
+        if not self.state.should_notify(dedup_key, self.dedup_minutes):
+            logger.info("Admin alert deduplicated: %s on %s", phase, cluster_id or "global")
+            return
+        self.state.record_notification(dedup_key)
+
+        admin_url = self.config.slack.admin_webhook_url
+        if not admin_url and not dry_run:
+            logger.warning("No admin Slack webhook configured, skipping app error notification")
+            return
+
+        cluster_label = cluster_name or cluster_id[:8] if cluster_id else "unknown"
+        error_str = str(error)
+        # Truncate very long tracebacks
+        if len(error_str) > 1500:
+            error_str = error_str[:1500] + "… (truncated)"
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"\U0001f6a8 Watchdog App Failure — {phase.upper()}",
+                },
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Cluster:*\n{cluster_label}"},
+                    {"type": "mrkdwn", "text": f"*Phase:*\n`{phase}`"},
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Time:*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                    },
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Error:*\n```{error_str}```",
+                },
+            },
+        ]
+
+        if context:
+            if len(context) > 500:
+                context = context[:500] + "… (truncated)"
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Context:*\n{context}"},
+            })
+
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "This alert is from the watchdog application itself, not a cluster finding. "
+                            "Check watchdog pod logs for full traceback.",
+                },
+            ],
+        })
+
+        message = {"blocks": blocks}
+
+        if dry_run:
+            logger.info("[DRY RUN] Would post app error to admin Slack:\n%s", json.dumps(message, indent=2))
+            return
+
+        await self._post_to_admin_slack(message)
+
+    async def _post_to_admin_slack(self, message: dict) -> None:
+        """POST message to admin Slack webhook with error handling."""
+        admin_url = self.config.slack.admin_webhook_url
+        if not admin_url:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(admin_url, json=message)
+                if resp.status_code != 200:
+                    logger.error(
+                        "Admin Slack webhook returned %d: %s",
+                        resp.status_code,
+                        resp.text[:200],
+                    )
+                else:
+                    logger.info("Posted app error to admin Slack successfully")
+        except httpx.TimeoutException:
+            logger.error("Admin Slack webhook timed out")
+        except Exception as e:
+            logger.error("Failed to post to admin Slack: %s", e)

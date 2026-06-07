@@ -19,6 +19,7 @@ class Verdict(str, Enum):
 
 class FindingCategory(str, Enum):
     OOMKILL = "oomkill"
+    CRASHLOOP = "crashloop"
     MISMATCH = "mismatch"
     UNSCHEDULABLE = "unschedulable"
     AGENT = "agent"
@@ -162,6 +163,7 @@ class EvaluationResult:
     )
     model_used: str = ""
     raw_response: str = ""  # for debugging
+    llm_failed: bool = False  # True when all LLM attempts failed
 
     def has_actionable_findings(self) -> bool:
         return self.verdict in (Verdict.WARNING, Verdict.CRITICAL)

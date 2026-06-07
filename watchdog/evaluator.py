@@ -64,17 +64,7 @@ response with this exact structure:
 
 {{{{
   "verdict": "HEALTHY" | "WARNING" | "CRITICAL",
-  "summary": "<one sentence overall assessment>",
-  "findings": [
-    {{{{
-      "severity": "critical" | "warning" | "info",
-      "category": "<oomkill|mismatch|unschedulable|agent|data_gap|memory_leak|absurd_recommendation|agent_restart|webhook_failure|cascading_scaling|config|other>",
-      "workload": "<namespace/workload or cluster-level>",
-      "what": "<what is happening>",
-      "evidence": "<specific numbers from the snapshot>",
-      "suggested_action": "<what the TAM or customer should do>"
-    }}}}
-  ],
+  "summary": "<2-3 sentence overall assessment for Slack — mention the most important issues by namespace/workload name and severity>",
   "metrics": {{{{
     "total_pods": <int>,
     "oomkilled_pods": <int>,
@@ -304,6 +294,7 @@ class Evaluator:
             )
         else:
             logger.error("All LLM evaluations failed, using raw metrics summary")
+            raw_result.llm_failed = True
 
         return raw_result
 
@@ -428,30 +419,11 @@ class Evaluator:
     def _build_result(
         self, parsed: dict, model: str, raw: str
     ) -> EvaluationResult:
-        """Convert parsed JSON into typed EvaluationResult."""
-        findings = []
-        for f in parsed.get("findings", []):
-            try:
-                try:
-                    category = FindingCategory(f.get("category", "other"))
-                except ValueError:
-                    logger.info("Unknown category '%s', mapping to OTHER", f.get("category"))
-                    category = FindingCategory.OTHER
-                try:
-                    severity = Severity(f.get("severity", "info"))
-                except ValueError:
-                    severity = Severity.INFO
-                findings.append(Finding(
-                    severity=severity,
-                    category=category,
-                    workload=f.get("workload", "unknown"),
-                    what=f.get("what", ""),
-                    evidence=f.get("evidence", ""),
-                    suggested_action=f.get("suggested_action", ""),
-                ))
-            except (ValueError, KeyError) as e:
-                logger.warning("Skipping malformed finding: %s", e)
+        """Convert parsed JSON into typed EvaluationResult.
 
+        The LLM provides verdict, summary, and metrics only.
+        Findings are generated separately by _raw_metrics_fallback.
+        """
         m = parsed.get("metrics", {})
         metrics = EvaluationMetrics(
             total_pods=m.get("total_pods", 0),
@@ -474,7 +446,7 @@ class Evaluator:
         return EvaluationResult(
             verdict=verdict,
             summary=parsed.get("summary", "No summary provided"),
-            findings=findings,
+            findings=[],  # LLM is summary-only; findings from _raw_metrics_fallback
             metrics=metrics,
             model_used=model,
             raw_response=raw[:2000],  # truncate for storage
@@ -826,7 +798,7 @@ class Evaluator:
             for cl in snapshot.crashloop_pods_detail[:10]:
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
-                    category=FindingCategory.OTHER,
+                    category=FindingCategory.CRASHLOOP,
                     workload=f"{cl['namespace']}/{cl['name']}",
                     what=f"Container `{cl.get('container', '?')}` in CrashLoopBackOff (restarts: {cl.get('restart_count', 0)})",
                     evidence=json.dumps(cl),
@@ -836,7 +808,7 @@ class Evaluator:
             if remaining > 0:
                 findings.append(Finding(
                     severity=Severity.INFO,
-                    category=FindingCategory.OTHER,
+                    category=FindingCategory.CRASHLOOP,
                     workload="cluster-level",
                     what=f"+{remaining} more pod(s) in CrashLoopBackOff",
                     evidence=f"crashloop_pods={snapshot.crashloop_pods}",
@@ -847,7 +819,7 @@ class Evaluator:
             _escalate(Severity.CRITICAL)
             findings.append(Finding(
                 severity=Severity.CRITICAL,
-                category=FindingCategory.OTHER,
+                category=FindingCategory.CRASHLOOP,
                 workload="cluster-level",
                 what=f"{snapshot.crashloop_pods} pod(s) in CrashLoopBackOff",
                 evidence=f"crashloop_pods={snapshot.crashloop_pods}",

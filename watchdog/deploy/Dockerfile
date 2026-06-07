@@ -14,6 +14,15 @@ RUN groupadd -r watchdog && useradd -r -g watchdog -d /app -s /sbin/nologin watc
 
 WORKDIR /app
 
+# Install snapshot-cli for Tier 2 GCS fallback
+# Download the latest release binary from GitHub (linux/amd64)
+ARG SNAPSHOT_CLI_VERSION=latest
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL -o /usr/local/bin/snapshot-cli \
+       "https://github.com/castai/snapshot-cli/releases/${SNAPSHOT_CLI_VERSION}/download/snapshot-cli-linux-amd64" \
+    && chmod +x /usr/local/bin/snapshot-cli \
+    && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
 # Copy deps from builder
 COPY --from=builder /deps /usr/local/lib/python3.11/site-packages/
 

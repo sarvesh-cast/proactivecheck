@@ -1,0 +1,440 @@
+{
+  "counts": {
+    "total_pods": 1173,
+    "total_nodes": 19,
+    "total_deps": 1403,
+    "total_recs": 927,
+    "total_metrics": 3102,
+    "oom_found": 2,
+    "agent_found": 2
+  },
+  "sample_pods": [
+    {
+      "metadata": {
+        "name": "report-center-service-7865c8d8d8-rbgsl",
+        "namespace": "pr-15666",
+        "creationTimestamp": "2026-06-07T11:57:44Z"
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True", "lastTransitionTime": "2026-06-07T11:58:10Z"},
+          {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-07T11:57:44Z"},
+          {"type": "Ready", "status": "False", "lastTransitionTime": "2026-06-07T12:51:16Z", "reason": "ContainersNotReady", "message": "containers with unready status: [report-center-service]"},
+          {"type": "ContainersReady", "status": "False", "lastTransitionTime": "2026-06-07T12:51:16Z", "reason": "ContainersNotReady"},
+          {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-06-07T11:57:44Z"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "report-center-service",
+            "state": {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off 5m0s restarting failed container=report-center-service pod=report-center-service-7865c8d8d8-rbgsl_pr-15666(5cf21f08-ae44-43f6-b679-f37de6e64950)"}},
+            "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled", "startedAt": "2026-06-07T13:27:47Z", "finishedAt": "2026-06-07T13:27:59Z"}},
+            "ready": false,
+            "restartCount": 13,
+            "image": "811085858398.dkr.ecr.us-east-2.amazonaws.com/report-center-service:pr-15666-79b4962",
+            "started": false,
+            "resources": {"limits": {"memory": "800Mi"}, "requests": {"cpu": "50m", "memory": "800Mi"}}
+          }
+        ]
+      },
+      "spec": {
+        "containers": [{"name": "report-center-service", "resources": {"limits": {"memory": "800Mi"}, "requests": {"cpu": "50m", "memory": "800Mi"}}}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "report-center-service-6f8bdb8bc7-8wrx5",
+        "namespace": "pr-15966",
+        "creationTimestamp": "2026-06-05T12:32:18Z"
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-05T16:04:48Z"},
+          {"type": "ContainersReady", "status": "True"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "report-center-service",
+            "state": {"running": {"startedAt": "2026-06-05T16:04:20Z"}},
+            "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled", "startedAt": "2026-06-05T12:40:42Z", "finishedAt": "2026-06-05T16:04:19Z"}},
+            "ready": true,
+            "restartCount": 1,
+            "started": true,
+            "resources": {"limits": {"memory": "800Mi"}, "requests": {"cpu": "50m", "memory": "800Mi"}}
+          }
+        ]
+      },
+      "spec": {
+        "containers": [{"name": "report-center-service", "resources": {"limits": {"memory": "800Mi"}, "requests": {"cpu": "50m", "memory": "800Mi"}}}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "castai-agent-f5ff76b8f-n25n6",
+        "namespace": "castai-agent",
+        "creationTimestamp": "2026-06-07T12:32:09Z"
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-07T12:34:24Z"},
+          {"type": "ContainersReady", "status": "True"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "agent",
+            "state": {"running": {"startedAt": "2026-06-07T12:32:18Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {"limits": {"cpu": "3", "memory": "5Gi"}, "requests": {"cpu": "2", "memory": "5Gi"}}
+          },
+          {
+            "name": "monitor",
+            "state": {"running": {"startedAt": "2026-06-07T12:32:19Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {"name": "agent", "resources": {"limits": {"cpu": "3", "memory": "5Gi"}, "requests": {"cpu": "2", "memory": "5Gi"}}},
+          {"name": "monitor", "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "castai-agent-f5ff76b8f-hxcqn",
+        "namespace": "castai-agent",
+        "creationTimestamp": "2026-06-04T15:35:56Z"
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-07T08:51:44Z"},
+          {"type": "ContainersReady", "status": "True"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "agent",
+            "state": {"running": {"startedAt": "2026-06-04T15:35:59Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {"limits": {"cpu": "3", "memory": "5Gi"}, "requests": {"cpu": "2", "memory": "5Gi"}}
+          },
+          {
+            "name": "monitor",
+            "state": {"running": {"startedAt": "2026-06-04T15:35:59Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {"name": "agent", "resources": {"limits": {"cpu": "3", "memory": "5Gi"}, "requests": {"cpu": "2", "memory": "5Gi"}}},
+          {"name": "monitor", "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "policy-scanner-29670480-24dkp",
+        "namespace": "acme-staging",
+        "creationTimestamp": "2026-06-01T15:39:04Z"
+      },
+      "status": {
+        "phase": "Pending",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": "containers with unready status: [policy-scanner]"},
+          {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "policy-scanner",
+            "state": {"waiting": {"reason": "ErrImagePull", "message": "rpc error: code = NotFound desc = failed to pull and unpack image"}},
+            "lastState": {},
+            "ready": false,
+            "restartCount": 0,
+            "started": false
+          }
+        ]
+      },
+      "spec": {
+        "containers": [{"name": "policy-scanner", "resources": {"limits": {"memory": "1000Mi"}, "requests": {"cpu": "100m", "memory": "1000Mi"}}}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "policy-scanner-29676480-m24jw",
+        "namespace": "pr-15807",
+        "creationTimestamp": "2026-06-06T20:11:21Z"
+      },
+      "status": {
+        "phase": "Pending",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "False", "reason": "ContainersNotReady"},
+          {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "policy-scanner",
+            "state": {"waiting": {"reason": "ImagePullBackOff", "message": "Back-off pulling image"}},
+            "lastState": {},
+            "ready": false,
+            "restartCount": 0,
+            "started": false
+          }
+        ]
+      },
+      "spec": {
+        "containers": [{"name": "policy-scanner", "resources": {"limits": {"memory": "1000Mi"}, "requests": {"cpu": "100m", "memory": "1000Mi"}}}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "backend-access-manager-55bcbc9948-6t6wz",
+        "namespace": "pr-15807",
+        "creationTimestamp": "2026-06-05T15:33:03Z"
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "True"},
+          {"type": "ContainersReady", "status": "True"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "backend-access-manager",
+            "state": {"running": {"startedAt": "2026-06-05T15:33:22Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {"limits": {"memory": "294Mi"}, "requests": {"cpu": "10m", "memory": "196Mi"}}
+          }
+        ]
+      },
+      "spec": {
+        "containers": [{"name": "backend-access-manager", "resources": {"limits": {"memory": "294Mi"}, "requests": {"cpu": "10m", "memory": "196Mi"}}}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "idp-worker-847b775bb9-t2x4d",
+        "namespace": "pr-15011",
+        "creationTimestamp": "2026-06-07T08:31:51Z"
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "True"},
+          {"type": "ContainersReady", "status": "True"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "idp-worker",
+            "state": {"running": {"startedAt": "2026-06-07T08:35:34Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {"limits": {"memory": "525Mi"}, "requests": {"cpu": "38m", "memory": "350Mi"}}
+          }
+        ]
+      },
+      "spec": {
+        "containers": [{"name": "idp-worker", "resources": {"limits": {"memory": "525Mi"}, "requests": {"cpu": "38m", "memory": "350Mi"}}}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "grafana-dev-us-1-alloy-logs-jl9h9",
+        "namespace": "monitoring",
+        "creationTimestamp": "2026-06-04T14:53:40Z"
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {"type": "PodReadyToStartContainers", "status": "True"},
+          {"type": "Initialized", "status": "True"},
+          {"type": "Ready", "status": "True"},
+          {"type": "ContainersReady", "status": "True"},
+          {"type": "PodScheduled", "status": "True"}
+        ],
+        "containerStatuses": [
+          {
+            "name": "alloy",
+            "state": {"running": {"startedAt": "2026-06-04T14:53:42Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {}
+          },
+          {
+            "name": "config-reloader",
+            "state": {"running": {"startedAt": "2026-06-04T14:53:42Z"}},
+            "lastState": {},
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "resources": {"requests": {"cpu": "10m", "memory": "50Mi"}}
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {"name": "alloy", "resources": {}},
+          {"name": "config-reloader", "resources": {"requests": {"cpu": "10m", "memory": "50Mi"}}}
+        ]
+      }
+    }
+  ],
+  "sample_nodes": [
+    {
+      "metadata": {"name": "ip-10-25-29-159.us-east-2.compute.internal"},
+      "status": {
+        "allocatable": {"cpu": "3920m", "ephemeral-storage": "212000118841", "memory": "64019948Ki", "pods": "110"},
+        "capacity": {"cpu": "4", "ephemeral-storage": "231199936Ki", "memory": "65036780Ki", "pods": "110"},
+        "conditions": [
+          {"type": "NetworkUnavailable", "status": "False", "reason": "CiliumIsUp"},
+          {"type": "MemoryPressure", "status": "False", "reason": "KubeletHasSufficientMemory"},
+          {"type": "DiskPressure", "status": "False", "reason": "KubeletHasNoDiskPressure"},
+          {"type": "PIDPressure", "status": "False", "reason": "KubeletHasSufficientPID"},
+          {"type": "Ready", "status": "True", "reason": "KubeletReady"}
+        ]
+      }
+    },
+    {
+      "metadata": {"name": "ip-10-25-11-47.us-east-2.compute.internal"},
+      "status": {
+        "allocatable": {"cpu": "3920m", "ephemeral-storage": "212000118841", "memory": "6933236Ki", "pods": "110"},
+        "capacity": {"cpu": "4", "ephemeral-storage": "231199936Ki", "memory": "7950068Ki", "pods": "110"},
+        "conditions": [
+          {"type": "NetworkUnavailable", "status": "False"},
+          {"type": "MemoryPressure", "status": "False"},
+          {"type": "DiskPressure", "status": "False"},
+          {"type": "PIDPressure", "status": "False"},
+          {"type": "Ready", "status": "True"}
+        ]
+      }
+    },
+    {
+      "metadata": {"name": "ip-10-25-25-112.us-east-2.compute.internal"},
+      "status": {
+        "allocatable": {"cpu": "3920m", "ephemeral-storage": "212000118841", "memory": "31233408Ki", "pods": "110"},
+        "capacity": {"cpu": "4", "ephemeral-storage": "231199936Ki", "memory": "32250240Ki", "pods": "110"},
+        "conditions": [
+          {"type": "NetworkUnavailable", "status": "False"},
+          {"type": "MemoryPressure", "status": "False"},
+          {"type": "DiskPressure", "status": "False"},
+          {"type": "PIDPressure", "status": "False"},
+          {"type": "Ready", "status": "True"}
+        ]
+      }
+    },
+    {
+      "metadata": {"name": "ip-10-25-16-32.us-east-2.compute.internal"},
+      "status": {
+        "allocatable": {"cpu": "3920m", "ephemeral-storage": "79063974985", "memory": "14967888Ki", "pods": "110"},
+        "capacity": {"cpu": "4", "ephemeral-storage": "86954988Ki", "memory": "15984720Ki", "pods": "110"},
+        "conditions": [
+          {"type": "NetworkUnavailable", "status": "False"},
+          {"type": "MemoryPressure", "status": "False"},
+          {"type": "DiskPressure", "status": "False"},
+          {"type": "PIDPressure", "status": "False"},
+          {"type": "Ready", "status": "True"}
+        ]
+      }
+    },
+    {
+      "metadata": {"name": "ip-10-25-3-25.us-east-2.compute.internal"},
+      "status": {
+        "allocatable": {"cpu": "7910m", "ephemeral-storage": "79063974985", "memory": "15032752Ki", "pods": "110"},
+        "capacity": {"cpu": "8", "ephemeral-storage": "86954988Ki", "memory": "16049584Ki", "pods": "110"},
+        "conditions": [
+          {"type": "NetworkUnavailable", "status": "False"},
+          {"type": "MemoryPressure", "status": "False"},
+          {"type": "DiskPressure", "status": "False"},
+          {"type": "PIDPressure", "status": "False"},
+          {"type": "Ready", "status": "True"}
+        ]
+      }
+    }
+  ],
+  "sample_deps": [
+    {"metadata": {"name": "discovery-realtime-discovery-pulling", "namespace": "apple-extend-env"}, "spec": {"replicas": 0}, "status": {"readyReplicas": 0, "availableReplicas": 0}},
+    {"metadata": {"name": "policy-workflows-worker", "namespace": "pr-15672"}, "spec": {"replicas": 0}, "status": {"readyReplicas": 0, "availableReplicas": 0}},
+    {"metadata": {"name": "error-pages", "namespace": "default"}, "spec": {"replicas": 1}, "status": {"readyReplicas": 1, "availableReplicas": 1}},
+    {"metadata": {"name": "backend", "namespace": "testrealdev"}, "spec": {"replicas": 2}, "status": {"readyReplicas": 2, "availableReplicas": 2}},
+    {"metadata": {"name": "browser-automation", "namespace": "dev-only-okta"}, "spec": {"replicas": 0}, "status": {"readyReplicas": 0, "availableReplicas": 0}},
+    {"metadata": {"name": "alerts-service", "namespace": "pr-15666"}, "spec": {"replicas": 0}, "status": {"readyReplicas": 0, "availableReplicas": 0}},
+    {"metadata": {"name": "saaspicious-editor-worker", "namespace": "pr-15769"}, "spec": {"replicas": 0}, "status": {"readyReplicas": 0, "availableReplicas": 0}},
+    {"metadata": {"name": "alerts-service", "namespace": "acme-latest"}, "spec": {"replicas": 1}, "status": {"readyReplicas": 1, "availableReplicas": 1}},
+    {"metadata": {"name": "opentelemetry-collector", "namespace": "pr-15461"}, "spec": {"replicas": 1}, "status": {"readyReplicas": 1, "availableReplicas": 1}},
+    {"metadata": {"name": "sspm-puller", "namespace": "pr-15769"}, "spec": {"replicas": 0}, "status": {"readyReplicas": 0, "availableReplicas": 0}}
+  ],
+  "sample_recs": [
+    {"metadata": {"name": "nango-deployment", "namespace": "gripdev"}, "spec": {"recommendation": [{"containerName": "nango", "requests": {"cpu": "10m", "memory": "247Mi"}, "limits": {"memory": "371Mi"}}]}},
+    {"metadata": {"name": "replicator-worker-deployment", "namespace": "pr-15926"}, "spec": {"recommendation": [{"containerName": "replicator-worker", "requests": {"cpu": "10m", "memory": "191Mi"}, "limits": {"memory": "286Mi"}}]}},
+    {"metadata": {"name": "aggregator-trigger-summary-tables-refresh-cronjob", "namespace": "apple-extend-env"}, "spec": {"recommendation": [{"containerName": "aggregator-trigger-summary-tables-refresh", "requests": {"cpu": "85m", "memory": "185Mi"}, "limits": {"memory": "277Mi"}}]}},
+    {"metadata": {"name": "opentelemetry-collector-deployment", "namespace": "pr-15600"}, "spec": {"recommendation": [{"containerName": "otc-container", "requests": {"cpu": "10m", "memory": "98Mi"}, "limits": {"memory": "147Mi"}}]}},
+    {"metadata": {"name": "workflow-engine-deployment", "namespace": "pr-15924"}, "spec": {"recommendation": [{"containerName": "workflow-engine", "requests": {"cpu": "42m", "memory": "350Mi"}, "limits": {"memory": "524Mi"}}]}},
+    {"metadata": {"name": "dashboard-deployment", "namespace": "pr-15600"}, "spec": {"recommendation": [{"containerName": "dashboard", "requests": {"cpu": "10m", "memory": "30Mi"}, "limits": {"memory": "128Mi"}}]}},
+    {"metadata": {"name": "workflows-worker-deployment", "namespace": "pr-15940"}, "spec": {"recommendation": [{"containerName": "workflows-worker", "requests": {"cpu": "10m", "memory": "199Mi"}, "limits": {"memory": "299Mi"}}]}},
+    {"metadata": {"name": "replicator-worker-deployment", "namespace": "pr-15966"}, "spec": {"recommendation": [{"containerName": "replicator-worker", "requests": {"cpu": "10m", "memory": "202Mi"}, "limits": {"memory": "302Mi"}}]}},
+    {"metadata": {"name": "workflows-worker-deployment", "namespace": "pr-15461"}, "spec": {"recommendation": [{"containerName": "workflows-worker", "requests": {"cpu": "10m", "memory": "193Mi"}, "limits": {"memory": "290Mi"}}]}},
+    {"metadata": {"name": "backend-daily-charts-cronjob", "namespace": "pr-15851"}, "spec": {"recommendation": [{"containerName": "backend", "requests": {"cpu": "113m", "memory": "377Mi"}, "limits": {"memory": "565Mi"}}]}}
+  ],
+  "sample_metrics": [
+    {"metadata": {"name": "aggregator-5bdbf57dfd-kpstc", "namespace": "acme-latest"}, "containers": [{"name": "aggregator", "usage": {"cpu": "16303556n", "memory": "994896Ki"}}]},
+    {"metadata": {"name": "aggregator-5d45764bdb-6lx4q", "namespace": "acme-latest"}, "containers": [{"name": "aggregator", "usage": {"cpu": "43544246n", "memory": "992880Ki"}}]},
+    {"metadata": {"name": "aggregator-5d45764bdb-ds6fr", "namespace": "acme-latest"}, "containers": [{"name": "aggregator", "usage": {"cpu": "20321945n", "memory": "1110148Ki"}}]},
+    {"metadata": {"name": "aggregator-6c9fb8976d-6cqpc", "namespace": "acme-latest"}, "containers": [{"name": "aggregator", "usage": {"cpu": "17313615n", "memory": "995644Ki"}}]},
+    {"metadata": {"name": "aggregator-business-owner-29680440-gth6b", "namespace": "acme-latest"}, "containers": [{"name": "aggregator", "usage": {"cpu": "0", "memory": "291712Ki"}}]},
+    {"metadata": {"name": "aggregator-trigger-summary-tables-refresh-29680560-6ml8m", "namespace": "acme-latest"}, "containers": [{"name": "aggregator-trigger-summary-tables-refresh", "usage": {"cpu": "115044n", "memory": "141524Ki"}}]},
+    {"metadata": {"name": "alerts-service-666fd7fd4d-4mb42", "namespace": "acme-latest"}, "containers": [{"name": "alerts-service", "usage": {"cpu": "2228774n", "memory": "226848Ki"}}]},
+    {"metadata": {"name": "alerts-service-6f8c767d84-djdpt", "namespace": "acme-latest"}, "containers": [{"name": "alerts-service", "usage": {"cpu": "1596825n", "memory": "239724Ki"}}]},
+    {"metadata": {"name": "alerts-service-7bfbffbb94-tcfmm", "namespace": "acme-latest"}, "containers": [{"name": "alerts-service", "usage": {"cpu": "1687817n", "memory": "240772Ki"}}]},
+    {"metadata": {"name": "backend-7bf78b79fb-d4jn8", "namespace": "acme-latest"}, "containers": [{"name": "backend", "usage": {"cpu": "1008940n", "memory": "503740Ki"}}]},
+    {"metadata": {"name": "backend-7bf78b79fb-k2psr", "namespace": "acme-latest"}, "containers": [{"name": "backend", "usage": {"cpu": "1298188n", "memory": "503508Ki"}}]},
+    {"metadata": {"name": "backend-7c6c945748-jxfzd", "namespace": "acme-latest"}, "containers": [{"name": "backend", "usage": {"cpu": "1244777n", "memory": "504044Ki"}}]},
+    {"metadata": {"name": "backend-7c6c945748-tfvj9", "namespace": "acme-latest"}, "containers": [{"name": "backend", "usage": {"cpu": "1157579n", "memory": "503912Ki"}}]},
+    {"metadata": {"name": "backend-7c6c945748-x42cl", "namespace": "acme-latest"}, "containers": [{"name": "backend", "usage": {"cpu": "58612112n", "memory": "517072Ki"}}]},
+    {"metadata": {"name": "backend-7cdcf7f876-czgws", "namespace": "acme-latest"}, "containers": [{"name": "backend", "usage": {"cpu": "1175483n", "memory": "504656Ki"}}]}
+  ]
+}

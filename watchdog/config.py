@@ -112,20 +112,21 @@ class CastAIConfig:
 
     @property
     def uses_api_key(self) -> bool:
-        """True when auth falls back to a customer API key (org-scoped, no expiry)."""
-        return bool(self.api_key) and not self.mcp_url
+        """True when an API key is available (org-scoped, no expiry)."""
+        return bool(self.api_key)
 
     @property
     def auth_headers(self) -> dict[str, str]:
-        # In API-only mode (no MCP URL), prefer the non-expiring API key.
-        # JWT tokens loaded from ~/.castai/ may be expired; the file-level
-        # expiry check can't decode the JWT payload, so stale tokens slip through.
-        if self.uses_api_key:
+        """Headers for direct CAST AI API calls (hybrid/api tier).
+
+        Always prefers the non-expiring API key over JWT tokens, which
+        can silently expire. The MCP client handles its own auth
+        separately (JWT/IAP) and does not use this property.
+        """
+        if self.api_key:
             return {"X-API-Key": self.api_key}
         if self.jwt_token:
             return {"Authorization": f"Bearer {self.jwt_token}"}
-        if self.api_key:
-            return {"X-API-Key": self.api_key}
         raise RuntimeError("No CAST AI credentials configured (set CASTAI_API_KEY or CASTAI_JWT_TOKEN)")
 
 
@@ -151,7 +152,8 @@ class SlackConfig:
     """Slack notification settings."""
 
     webhook_url: str = field(default_factory=lambda: os.getenv("SLACK_WEBHOOK_URL", ""))
-    channel: str = field(default_factory=lambda: os.getenv("SLACK_CHANNEL", "#castai_grip_security_ext"))
+    admin_webhook_url: str = field(default_factory=lambda: os.getenv("SLACK_ADMIN_WEBHOOK_URL", ""))
+    channel: str = field(default_factory=lambda: os.getenv("SLACK_CHANNEL", ""))
     dedup_window_minutes: int = field(default_factory=lambda: int(os.getenv("SLACK_DEDUP_MINUTES", "30")))
     daily_summary_hour_utc: int = field(default_factory=lambda: int(os.getenv("SLACK_DAILY_SUMMARY_HOUR_UTC", "8")))
 
@@ -194,6 +196,25 @@ class ClusterContext:
 
 
 @dataclass(frozen=True)
+class SnapshotConfig:
+    """GCS snapshot-cli configuration for Tier 2 fallback.
+
+    When the MCP server is unavailable, the watchdog can read GCS snapshots
+    directly via the snapshot-cli binary.  Requires GCS auth (workload identity
+    or GOOGLE_APPLICATION_CREDENTIALS).
+    """
+
+    gcs_bucket: str = field(default_factory=lambda: os.getenv(
+        "GCS_SNAPSHOT_BUCKET",
+        "prod-master-console-cluster-snapshots-snapshotstore",
+    ))
+    cli_path: str = field(default_factory=lambda: os.getenv("SNAPSHOT_CLI_PATH", ""))
+    enabled: bool = field(default_factory=lambda: os.getenv(
+        "SNAPSHOT_FALLBACK_ENABLED", "true"
+    ).lower() == "true")
+
+
+@dataclass(frozen=True)
 class Thresholds:
     """Detection thresholds — maps to the classification rules in the design doc."""
 
@@ -230,6 +251,7 @@ class WatchdogConfig:
     slack: SlackConfig = field(default_factory=SlackConfig)
     cluster: ClusterContext = field(default_factory=ClusterContext)
     thresholds: Thresholds = field(default_factory=Thresholds)
+    snapshot: SnapshotConfig = field(default_factory=SnapshotConfig)
 
     run_interval_seconds: int = 300  # 5 minutes
     rolling_window_size: int = 12  # 12 snapshots = 1 hour

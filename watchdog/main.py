@@ -42,12 +42,29 @@ Usage:
     # Single snapshot at a specific time (collector-only)
     python -m watchdog --collector-only --snapshot-time 2026-05-21T05:00:00Z
 
+    # ── Tier testing flags (hybrid flow verification) ────────────
+    # Force a specific collector tier — no cascade
+    python -m watchdog --collector-only --force-tier=hybrid
+    python -m watchdog --collector-only --force-tier=mcp
+    python -m watchdog --collector-only --force-tier=api
+
+    # Print tier diagnostics (which tier ran, timing, field coverage)
+    python -m watchdog --collector-only --tier-report
+    python -m watchdog --collector-only --force-tier=hybrid --tier-report
+
+    # Compare all available tiers side-by-side
+    python -m watchdog --compare-tiers
+
+    # Full pipeline with tier report (useful for debugging cascade)
+    python -m watchdog --once --force-tier=hybrid --tier-report
+
 Environment variables:
     CASTAI_API_KEY or CASTAI_JWT_TOKEN  — CAST AI authentication
     CASTAI_ORG_ID                       — Organization ID
     LLM_API_KEY                         — LLM API key (falls back to CASTAI_API_KEY)
     LLM_BASE_URL                        — OpenAI-compatible endpoint (default: https://llm.kimchi.dev/openai/v1)
-    SLACK_WEBHOOK_URL                   — Slack incoming webhook
+    SLACK_WEBHOOK_URL                   — Slack incoming webhook (findings channel)
+    SLACK_ADMIN_WEBHOOK_URL             — Slack webhook for app execution failures (admin channel)
     WATCHDOG_CLUSTER_ID                 — Target cluster ID
     WATCHDOG_DRY_RUN=true               — Evaluate but don't post
     WATCHDOG_STATE_FILE                 — Path to state file
@@ -67,6 +84,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
+
 from .collector import Collector
 from .config import WatchdogConfig
 from .evaluator import Evaluator
@@ -80,8 +99,24 @@ logger = logging.getLogger("watchdog")
 async def _fetch_cluster_name_map(config: WatchdogConfig) -> dict[str, str]:
     """Fetch {cluster_id: cluster_name} from list_clusters.
 
+    Tries the public API first (fast, uses API key), then MCP as fallback.
     Returns empty dict on failure so callers fall back gracefully.
     """
+    # ── Try public API first (no MCP session overhead, works with API key) ──
+    if config.castai.api_key:
+        try:
+            async with httpx.AsyncClient(
+                headers=config.castai.auth_headers,
+                timeout=10,
+            ) as client:
+                resp = await client.get(f"{config.castai.api_url}/v1/kubernetes/external-clusters")
+                resp.raise_for_status()
+                items = resp.json().get("items", [])
+                return {cl["id"]: cl.get("name", "") for cl in items if cl.get("id")}
+        except Exception as e:
+            logger.debug("API cluster name lookup failed: %s", e)
+
+    # ── Fallback: MCP list_clusters (requires valid JWT) ──
     if not config.castai.mcp_url:
         return {}
     from .mcp_client import MCPClient
@@ -136,10 +171,34 @@ async def _resolve_cluster_ids(config: WatchdogConfig) -> list[dict]:
             name = name_map.get(config.cluster.cluster_id, "")
         return [{"id": config.cluster.cluster_id, "name": name}]
 
-    # Nothing set — auto-discover all clusters from org
+    # Nothing set — auto-discover all clusters from org.
+    # Try public API first (works with API key, no MCP needed), then MCP fallback.
     logger.info("No cluster IDs configured, discovering from org...")
+
+    # ── Try public API first ──
+    if config.castai.api_key:
+        try:
+            async with httpx.AsyncClient(
+                headers=config.castai.auth_headers,
+                timeout=10,
+            ) as client:
+                resp = await client.get(f"{config.castai.api_url}/v1/kubernetes/external-clusters")
+                resp.raise_for_status()
+                items = resp.json().get("items", [])
+                discovered = [
+                    {"id": cl["id"], "name": cl.get("name", "")}
+                    for cl in items
+                    if isinstance(cl, dict) and cl.get("id")
+                ]
+                labels = [f"{c['name'] or '?'} ({c['id'][:8]})" for c in discovered]
+                logger.info("Auto-discovered %d clusters via API: %s", len(discovered), ", ".join(labels))
+                return discovered
+        except Exception as e:
+            logger.warning("API cluster auto-discovery failed: %s — trying MCP", e)
+
+    # ── Fallback: MCP list_clusters ──
     if not config.castai.mcp_url:
-        logger.error("Cannot auto-discover clusters: CASTAI_MCP_URL not set")
+        logger.error("Cannot auto-discover clusters: no API key and CASTAI_MCP_URL not set")
         return []
     from .mcp_client import MCPClient
     mcp = MCPClient(
@@ -208,7 +267,7 @@ async def _resolve_cluster_ids(config: WatchdogConfig) -> list[dict]:
             if isinstance(cl, dict) and cl.get("id")
         ]
         labels = [f"{c['name'] or '?'} ({c['id'][:8]})" for c in discovered]
-        logger.info("Auto-discovered %d clusters: %s", len(discovered), ", ".join(labels))
+        logger.info("Auto-discovered %d clusters via MCP: %s", len(discovered), ", ".join(labels))
         return discovered
     except Exception as e:
         logger.error("Cluster auto-discovery failed: %s", e, exc_info=True)
@@ -228,10 +287,16 @@ def _config_for_cluster(base_config: WatchdogConfig, cluster_id: str, cluster_na
 class Watchdog:
     """Orchestrates the collect → evaluate → notify pipeline."""
 
-    def __init__(self, config: WatchdogConfig | None = None, snapshot_time: str | None = None) -> None:
+    def __init__(
+        self,
+        config: WatchdogConfig | None = None,
+        snapshot_time: str | None = None,
+        force_tier: str | None = None,
+    ) -> None:
         self.config = config or WatchdogConfig()
         self.snapshot_time = snapshot_time
-        self.collector = Collector(self.config, snapshot_time=snapshot_time)
+        self.force_tier = force_tier
+        self.collector = Collector(self.config, snapshot_time=snapshot_time, force_tier=force_tier)
         self.evaluator = Evaluator(self.config)
         self.state = StateManager(
             self.config.state_file, self.config.rolling_window_size
@@ -239,7 +304,7 @@ class Watchdog:
         self.notifier = Notifier(self.config, self.state)
         self._shutdown = False
 
-    async def run_once(self) -> None:
+    async def run_once(self, tier_report: bool = False) -> None:
         """Execute a single collect → evaluate → notify cycle."""
         cycle_start = time.monotonic()
         logger.info("=== Watchdog cycle starting at %s ===", datetime.now(timezone.utc).isoformat())
@@ -247,6 +312,8 @@ class Watchdog:
         # ── Phase 1: Collect ──────────────────────────────────────
         try:
             snapshot = await self.collector.collect()
+            if tier_report:
+                print(self.collector.tier_report(snapshot), file=sys.stderr)
             logger.info(
                 "Collected: %d pods (%d OOMKilled, %d Pending, %d CrashLoop), "
                 "%d nodes, %d collection errors",
@@ -259,7 +326,24 @@ class Watchdog:
             )
         except Exception as e:
             logger.error("Collection phase failed entirely: %s", e, exc_info=True)
+            await self.notifier.notify_app_error(
+                "collector", e,
+                cluster_id=self.config.cluster.cluster_id,
+                cluster_name=self.config.cluster.cluster_name,
+                context=f"Failed to collect snapshot for cluster {self.config.cluster.cluster_name}",
+                dry_run=self.config.dry_run,
+            )
             return  # Can't evaluate without data
+
+        # Alert admin on partial collection failures (e.g. MCP timeout, API 403)
+        if snapshot.collection_errors:
+            await self.notifier.notify_app_error(
+                "collector", f"{len(snapshot.collection_errors)} partial collection error(s)",
+                cluster_id=self.config.cluster.cluster_id,
+                cluster_name=self.config.cluster.cluster_name,
+                context="; ".join(snapshot.collection_errors[:5]),
+                dry_run=self.config.dry_run,
+            )
 
         # Store snapshot in rolling window
         self.state.push_snapshot(snapshot.to_dict_compact())
@@ -301,8 +385,27 @@ class Watchdog:
                 len(result.findings),
                 result.model_used,
             )
+
+            # Alert admin if LLM is completely down (findings still work via raw metrics)
+            if result.llm_failed:
+                await self.notifier.notify_app_error(
+                    "llm", "All LLM models failed after retries — using raw metrics summary only",
+                    cluster_id=self.config.cluster.cluster_id,
+                    cluster_name=self.config.cluster.cluster_name,
+                    context=f"Models tried: {self.evaluator.model}, {self.evaluator.fallback_model}. "
+                            f"Raw metrics produced {len(result.findings)} findings.",
+                    dry_run=self.config.dry_run,
+                )
         except Exception as e:
             logger.error("Evaluation phase failed: %s", e, exc_info=True)
+            await self.notifier.notify_app_error(
+                "evaluator", e,
+                cluster_id=self.config.cluster.cluster_id,
+                cluster_name=self.config.cluster.cluster_name,
+                context=f"Snapshot had {snapshot.total_pods} pods, {snapshot.node_count} nodes, "
+                        f"{len(snapshot.collection_errors)} collection errors",
+                dry_run=self.config.dry_run,
+            )
             # Still save state even if evaluation fails
             self.state.save()
             return
@@ -312,6 +415,15 @@ class Watchdog:
             await self.notifier.notify(result, dry_run=self.config.dry_run)
         except Exception as e:
             logger.error("Notification phase failed: %s", e, exc_info=True)
+            # Notify admin about notification failure (ironic but important —
+            # uses separate admin webhook so a findings-webhook outage is visible)
+            await self.notifier.notify_app_error(
+                "notifier", e,
+                cluster_id=self.config.cluster.cluster_id,
+                cluster_name=self.config.cluster.cluster_name,
+                context=f"Failed to post {len(result.findings)} findings (verdict={result.verdict.value})",
+                dry_run=self.config.dry_run,
+            )
             # Non-fatal — we still save state
 
         # ── Housekeeping ──────────────────────────────────────────
@@ -424,6 +536,16 @@ class Watchdog:
                 await self.run_once()
             except Exception as e:
                 logger.error("Unhandled error in watchdog cycle: %s", e, exc_info=True)
+                try:
+                    await self.notifier.notify_app_error(
+                        "run_cycle", e,
+                        cluster_id=self.config.cluster.cluster_id,
+                        cluster_name=self.config.cluster.cluster_name,
+                        context="Unhandled exception escaped run_once — full cycle failed",
+                        dry_run=self.config.dry_run,
+                    )
+                except Exception:
+                    logger.error("Failed to send app error alert for unhandled exception")
 
             # Sleep in small increments to allow graceful shutdown
             for _ in range(self.config.run_interval_seconds):
@@ -440,10 +562,13 @@ class Watchdog:
 
     # ── Per-module test methods ─────────────────────────────────────
 
-    async def run_collector_only(self) -> None:
+    async def run_collector_only(self, tier_report: bool = False) -> None:
         """Run only the collector, print snapshot JSON to stdout."""
         logger.info("Running collector only against cluster %s", self.config.cluster.cluster_id)
         snapshot = await self.collector.collect()
+
+        if tier_report:
+            print(self.collector.tier_report(snapshot), file=sys.stderr)
         self.state.push_snapshot(snapshot.to_dict_compact())
         self.state.save()
 
@@ -481,6 +606,100 @@ class Watchdog:
             print("  No errors — all collectors succeeded", file=sys.stderr)
 
         print("=" * 70 + "\n", file=sys.stderr)
+
+    async def run_compare_tiers(self) -> None:
+        """Run all available tiers sequentially and compare field coverage.
+
+        Useful for verifying that hybrid produces the same signals as MCP.
+        Each tier runs in isolation (fresh SnapshotData) — no cascade.
+        """
+        import time as _time
+        from dataclasses import fields as dc_fields
+
+        tiers_to_test = []
+        if self.collector.mcp:
+            tiers_to_test.append("mcp")
+        if self.collector.snap:
+            tiers_to_test.append("hybrid")
+        tiers_to_test.append("api")  # always available
+
+        if len(tiers_to_test) < 2:
+            print("Only 1 tier available — nothing to compare. "
+                  "Need at least MCP or hybrid + API.", file=sys.stderr)
+            return
+
+        results: dict[str, dict] = {}
+        for tier in tiers_to_test:
+            logger.info("── compare-tiers: running tier '%s' ──", tier)
+            collector = Collector(
+                self.config, snapshot_time=self.snapshot_time, force_tier=tier,
+            )
+            try:
+                snapshot = await collector.collect()
+                results[tier] = {
+                    "total_pods": snapshot.total_pods,
+                    "running_pods": snapshot.running_pods,
+                    "pending_pods": snapshot.pending_pods,
+                    "crashloop_pods": snapshot.crashloop_pods,
+                    "oomkilled_pods": len(snapshot.oomkilled_pods),
+                    "node_count": snapshot.node_count,
+                    "nodes_detail": len(snapshot.nodes),
+                    "agent_pods": len(snapshot.agent_pods),
+                    "agent_restarts": snapshot.agent_restarts_last_hour,
+                    "mismatches": len(snapshot.recommendation_mismatches),
+                    "absurd_recs": len(snapshot.absurd_recommendations),
+                    "data_gaps": len(snapshot.data_gaps),
+                    "memory_usage": len(snapshot.workload_memory_usage),
+                    "log_signals": len(snapshot.log_signals),
+                    "errors": len(snapshot.collection_errors),
+                    "duration_ms": collector.tier_duration_ms,
+                }
+            except Exception as e:
+                logger.error("Tier '%s' failed: %s", tier, e)
+                results[tier] = {"error": str(e)}
+
+        # Print comparison table
+        print("\n" + "=" * 80, file=sys.stderr)
+        print("  TIER COMPARISON", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+
+        # Header
+        tier_names = list(results.keys())
+        header = f"  {'Field':<25}"
+        for t in tier_names:
+            header += f" {t:>10}"
+        print(header, file=sys.stderr)
+        print("  " + "-" * (25 + 11 * len(tier_names)), file=sys.stderr)
+
+        # Check if any tier errored
+        for t in tier_names:
+            if "error" in results[t]:
+                print(f"  {t} FAILED: {results[t]['error']}", file=sys.stderr)
+
+        # Rows
+        all_fields = [
+            "total_pods", "running_pods", "pending_pods", "crashloop_pods",
+            "oomkilled_pods", "node_count", "nodes_detail", "agent_pods",
+            "agent_restarts", "mismatches", "absurd_recs", "data_gaps",
+            "memory_usage", "log_signals", "errors", "duration_ms",
+        ]
+        for field in all_fields:
+            row = f"  {field:<25}"
+            values = []
+            for t in tier_names:
+                val = results[t].get(field, "—")
+                if field == "duration_ms" and isinstance(val, (int, float)):
+                    row += f" {val:>9.0f}ms"
+                else:
+                    row += f" {val:>10}"
+                values.append(val)
+            # Mark divergences
+            numeric = [v for v in values if isinstance(v, (int, float))]
+            if len(set(numeric)) > 1 and field != "duration_ms" and field != "errors" and field != "log_signals":
+                row += "  ← differs"
+            print(row, file=sys.stderr)
+
+        print("=" * 80 + "\n", file=sys.stderr)
 
     async def run_evaluator_only(
         self, fixture_path: str | None = None, raw_fallback: bool = False,
@@ -676,6 +895,20 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Run collect+evaluate at one or more historical timestamps. "
                          "e.g. --backtest 2026-05-21T05:00:00Z 2026-06-01T18:30:00Z")
 
+    # ── Tier testing flags ──
+    p.add_argument("--force-tier", type=str, default=None,
+                    choices=["mcp", "hybrid", "api"],
+                    help="Force collector to use only this tier (no cascade). "
+                         "mcp = MCP server only, hybrid = snapshot-cli + API, "
+                         "api = public API only. Errors if prerequisites not met.")
+    p.add_argument("--tier-report", action="store_true",
+                    help="After collection, print a diagnostic report showing which "
+                         "tier ran, timing, field coverage, and errors. "
+                         "Combine with --collector-only for quick testing.")
+    p.add_argument("--compare-tiers", action="store_true",
+                    help="Run all available tiers sequentially and print a side-by-side "
+                         "comparison of field coverage. Use with --collector-only.")
+
     return p
 
 
@@ -704,14 +937,19 @@ async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
             logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
 
         snapshot_time = getattr(args, "snapshot_time", None)
-        watchdog = Watchdog(cfg, snapshot_time=snapshot_time)
+        force_tier = getattr(args, "force_tier", None)
+        watchdog = Watchdog(cfg, snapshot_time=snapshot_time, force_tier=force_tier)
 
         if getattr(args, "backtest", None):
             await watchdog.run_backtest(args.backtest)
         elif args.state_dump:
             watchdog.dump_state()
+        elif getattr(args, "compare_tiers", False):
+            await watchdog.run_compare_tiers()
         elif args.collector_only:
-            await watchdog.run_collector_only()
+            await watchdog.run_collector_only(
+                tier_report=getattr(args, "tier_report", False),
+            )
         elif args.evaluator_only:
             await watchdog.run_evaluator_only(
                 fixture_path=args.fixture,
@@ -720,7 +958,9 @@ async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
         elif args.notifier_only:
             await watchdog.run_notifier_only()
         elif args.once:
-            await watchdog.run_once()
+            await watchdog.run_once(
+                tier_report=getattr(args, "tier_report", False),
+            )
         else:
             # Continuous loop — run all clusters each cycle
             await _run_multi_loop(base_config, clusters, args)
@@ -755,11 +995,24 @@ async def _run_multi_loop(base_config: WatchdogConfig, clusters: list[dict], arg
             cfg = _config_for_cluster(base_config, cid, cname) if is_multi else base_config
             if is_multi:
                 logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
-            watchdog = Watchdog(cfg)
+            force_tier = getattr(args, "force_tier", None)
+            watchdog = Watchdog(cfg, force_tier=force_tier)
             try:
-                await watchdog.run_once()
+                await watchdog.run_once(
+                    tier_report=getattr(args, "tier_report", False),
+                )
             except Exception as e:
                 logger.error("Error on cluster %s: %s", cid, e, exc_info=True)
+                try:
+                    await watchdog.notifier.notify_app_error(
+                        "run_cycle", e,
+                        cluster_id=cid,
+                        cluster_name=cname,
+                        context="Unhandled exception in multi-cluster loop",
+                        dry_run=base_config.dry_run,
+                    )
+                except Exception:
+                    logger.error("Failed to send app error alert for cluster %s", cid)
 
         for _ in range(base_config.run_interval_seconds):
             if shutdown:

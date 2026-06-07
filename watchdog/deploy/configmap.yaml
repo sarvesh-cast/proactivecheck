@@ -37,6 +37,12 @@ data:
   SLACK_DEDUP_MINUTES: "30"
   SLACK_DAILY_SUMMARY_HOUR_UTC: "8"
 
+  # ── Snapshot Analyzer (Tier 2 fallback) ────────────────────────
+  # GCS bucket for direct snapshot access when MCP is unavailable
+  GCS_SNAPSHOT_BUCKET: "prod-master-console-cluster-snapshots-snapshotstore"
+  # Set to "false" to disable Tier 2 and fall through to pure API
+  SNAPSHOT_FALLBACK_ENABLED: "true"
+
   # ── Watchdog behavior ─────────────────────────────────────────
   WATCHDOG_STATE_FILE: "/data/watchdog_state.json"
   WATCHDOG_DRY_RUN: "false"
