@@ -794,25 +794,15 @@ for wl in wls:
         if am > 0 and rm >= am * OR:
             r = round(rm / am, 1)
             ab.append(mk(wk, cn, wt, {{"sub_type": "ratio_breach", "recommended_memory_gib": round(rm, 1), "applied_memory_gib": round(am, 1), "rec_display": fm(rm), "applied_display": fm(am), "limit_request_ratio": r, "reason": "Rec " + fm(rm) + " is " + str(r) + "x current " + fm(am)}}))
-        if ac > 0 and rc >= ac * OR:
-            r = round(rc / ac, 1)
-            ab.append(mk(wk, cn, wt, {{"sub_type": "ratio_breach", "recommended_cpu_cores": round(rc, 1), "applied_cpu_cores": round(ac, 1), "rec_display": fc(rc), "applied_display": fc(ac), "limit_request_ratio": r, "reason": "Rec " + fc(rc) + " is " + str(r) + "x current " + fc(ac)}}))
         if om > 0 and am >= om * OR:
             r = round(am / om, 1)
             ab.append(mk(wk, cn, wt, {{"sub_type": "baseline_ratio_breach", "recommended_memory_gib": round(rm, 1), "applied_memory_gib": round(am, 1), "original_memory_gib": round(om, 3), "rec_display": fm(am), "applied_display": fm(om), "limit_request_ratio": r, "reason": "Current " + fm(am) + " is " + str(r) + "x baseline " + fm(om)}}))
-        if oc > 0 and ac >= oc * OR:
-            r = round(ac / oc, 1)
-            ab.append(mk(wk, cn, wt, {{"sub_type": "baseline_ratio_breach", "recommended_cpu_cores": round(rc, 1), "applied_cpu_cores": round(ac, 1), "original_cpu_cores": round(oc, 3), "rec_display": fc(ac), "applied_display": fc(oc), "limit_request_ratio": r, "reason": "Current " + fc(ac) + " is " + str(r) + "x baseline " + fc(oc)}}))
         if pc <= 0:
             continue
         if am and rm:
             p = abs(rm - am) / am * 100
             if p > MP and abs(rm - am) >= MMG:
                 mm.append(mk(wk, cn, wt, {{"apply_type": at, "recommended_memory_gib": round(rm, 1), "actual_memory_gib": round(am, 1), "rec_display": fm(rm), "applied_display": fm(am), "diff_pct": round(p, 1)}}))
-        if ac and rc:
-            p = abs(rc - ac) / ac * 100
-            if p > MP and abs(rc - ac) >= MMC:
-                mm.append(mk(wk, cn, wt, {{"apply_type": at, "recommended_cpu_cores": round(rc, 1), "actual_cpu_cores": round(ac, 1), "rec_display": fc(rc), "applied_display": fc(ac), "diff_pct": round(p, 1)}}))
 
 result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_lookup": rl}}
 '''
@@ -1291,17 +1281,6 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                                           f"(applied {req_mem_gib:.1f} GiB)",
                                 "source": "woop_metrics_backtest",
                             })
-                        if rec_cpu_cores > t.absurd_cpu_cores:
-                            absurd.append({
-                                "workload": wl_key, "container": c_name,
-                                "woop": woop_tag,
-                                "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                                "applied_cpu_cores": round(req_cpu_cores, 1),
-                                "reason": f"Historical WOOP recommended "
-                                          f"{rec_cpu_cores:.1f} CPU cores "
-                                          f"(applied {req_cpu_cores:.1f})",
-                                "source": "woop_metrics_backtest",
-                            })
 
                         # Also flag absurd applied values
                         if req_mem_gib > t.absurd_memory_gib:
@@ -1312,16 +1291,6 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                                 "recommended_memory_gib": round(rec_mem_gib, 1),
                                 "reason": f"Applied {req_mem_gib:.1f} GiB memory "
                                           f"(recommended {rec_mem_gib:.1f} GiB)",
-                                "source": "woop_metrics_backtest",
-                            })
-                        if req_cpu_cores > t.absurd_cpu_cores:
-                            absurd.append({
-                                "workload": wl_key, "container": c_name,
-                                "woop": woop_tag,
-                                "applied_cpu_cores": round(req_cpu_cores, 1),
-                                "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                                "reason": f"Applied {req_cpu_cores:.1f} CPU cores "
-                                          f"(recommended {rec_cpu_cores:.1f})",
                                 "source": "woop_metrics_backtest",
                             })
 
@@ -1335,18 +1304,6 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                                     "woop": woop_tag,
                                     "recommended_memory_gib": round(rec_mem_gib, 1),
                                     "actual_memory_gib": round(req_mem_gib, 1),
-                                    "diff_pct": round(pct, 1),
-                                    "source": "woop_metrics_backtest",
-                                })
-                        if req_cpu_cores and rec_cpu_cores:
-                            pct = abs(rec_cpu_cores - req_cpu_cores) / req_cpu_cores * 100
-                            abs_delta = abs(rec_cpu_cores - req_cpu_cores)
-                            if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_cpu_cores:
-                                mismatches.append({
-                                    "workload": wl_key, "container": c_name,
-                                    "woop": woop_tag,
-                                    "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                                    "actual_cpu_cores": round(req_cpu_cores, 1),
                                     "diff_pct": round(pct, 1),
                                     "source": "woop_metrics_backtest",
                                 })
@@ -2120,19 +2077,6 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                         "reason": f"Rec {rec_mem_gib:.1f} GiB is {rec_ratio}x "
                                   f"the current request {act_mem_gib:.1f} GiB",
                     })
-                # Ratio breach: recommendation >= 10x current request (CPU)
-                if act_cpu_cores > 0 and rec_cpu_cores >= act_cpu_cores * t.outlier_median_ratio:
-                    cpu_ratio = round(rec_cpu_cores / act_cpu_cores, 1)
-                    absurd.append({
-                        "workload": wl_key, "container": c_name,
-                        "woop": woop_tag,
-                        "sub_type": "ratio_breach",
-                        "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                        "applied_cpu_cores": round(act_cpu_cores, 1),
-                        "limit_request_ratio": cpu_ratio,
-                        "reason": f"Rec {rec_cpu_cores:.1f} CPU is {cpu_ratio}x "
-                                  f"the current request {act_cpu_cores:.1f} CPU",
-                    })
 
                 # Baseline ratio breach: current applied >= 10x original baseline (memory)
                 if orig_mem_gib > 0 and act_mem_gib >= orig_mem_gib * t.outlier_median_ratio:
@@ -2148,20 +2092,6 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                         "reason": f"Current {act_mem_gib:.1f} GiB is {base_ratio}x "
                                   f"the original baseline {orig_mem_gib:.3f} GiB",
                     })
-                # Baseline ratio breach: current applied >= 10x original baseline (CPU)
-                if orig_cpu_cores > 0 and act_cpu_cores >= orig_cpu_cores * t.outlier_median_ratio:
-                    base_ratio = round(act_cpu_cores / orig_cpu_cores, 1)
-                    absurd.append({
-                        "workload": wl_key, "container": c_name,
-                        "woop": woop_tag,
-                        "sub_type": "baseline_ratio_breach",
-                        "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                        "applied_cpu_cores": round(act_cpu_cores, 1),
-                        "original_cpu_cores": round(orig_cpu_cores, 3),
-                        "limit_request_ratio": base_ratio,
-                        "reason": f"Current {act_cpu_cores:.1f} CPU is {base_ratio}x "
-                                  f"the original baseline {orig_cpu_cores:.3f} CPU",
-                    })
 
                 # Skip mismatch for workloads with 0 running pods — no pods
                 # means recommendation can't be applied; mismatch is expected.
@@ -2173,13 +2103,6 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                     pct = abs(rec_mem_gib - act_mem_gib) / act_mem_gib * 100
                     abs_delta = abs(rec_mem_gib - act_mem_gib)
                     if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_memory_gib:
-                        mismatches.append({"workload": wl_key, "container": c_name,
-                                           "woop": woop_tag, "diff_pct": round(pct, 1),
-                                           "pod_count": pod_count})
-                if act_cpu_cores and rec_cpu_cores:
-                    pct = abs(rec_cpu_cores - act_cpu_cores) / act_cpu_cores * 100
-                    abs_delta = abs(rec_cpu_cores - act_cpu_cores)
-                    if pct > t.recommendation_mismatch_pct and abs_delta >= t.mismatch_min_cpu_cores:
                         mismatches.append({"workload": wl_key, "container": c_name,
                                            "woop": woop_tag, "diff_pct": round(pct, 1),
                                            "pod_count": pod_count})

@@ -506,19 +506,6 @@ def analyze_recommendations(
                     "limit_request_ratio": rec_ratio,
                     "reason": f"Rec {fmt_mem(rec_mem_gib)} is {rec_ratio}x the current request {fmt_mem(act_mem_gib)}",
                 })
-            # Ratio breach: rec >= 10x actual (CPU)
-            if act_cpu_cores > 0 and rec_cpu_cores >= act_cpu_cores * thresholds.outlier_median_ratio:
-                cpu_ratio = round(rec_cpu_cores / act_cpu_cores, 1)
-                absurd.append({
-                    "workload": wl_key, "container": c_name, "woop": woop_tag,
-                    "sub_type": "ratio_breach",
-                    "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                    "applied_cpu_cores": round(act_cpu_cores, 1),
-                    "rec_display": f"{round(rec_cpu_cores, 1)} CPU",
-                    "applied_display": f"{round(act_cpu_cores, 1)} CPU",
-                    "limit_request_ratio": cpu_ratio,
-                    "reason": f"Rec {round(rec_cpu_cores, 1)} CPU is {cpu_ratio}x the current request {round(act_cpu_cores, 1)} CPU",
-                })
 
             # Baseline ratio breach: current applied >= 10x original baseline (memory)
             # Catches already-applied absurd recs where rec ≈ current >> original
@@ -534,20 +521,6 @@ def analyze_recommendations(
                     "applied_display": fmt_mem(orig_mem_gib),
                     "limit_request_ratio": base_ratio,
                     "reason": f"Current {fmt_mem(act_mem_gib)} is {base_ratio}x the original baseline {fmt_mem(orig_mem_gib)}",
-                })
-            # Baseline ratio breach: current applied >= 10x original baseline (CPU)
-            if orig_cpu_cores > 0 and act_cpu_cores >= orig_cpu_cores * thresholds.outlier_median_ratio:
-                base_ratio = round(act_cpu_cores / orig_cpu_cores, 1)
-                absurd.append({
-                    "workload": wl_key, "container": c_name, "woop": woop_tag,
-                    "sub_type": "baseline_ratio_breach",
-                    "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                    "applied_cpu_cores": round(act_cpu_cores, 1),
-                    "original_cpu_cores": round(orig_cpu_cores, 3),
-                    "rec_display": f"{round(act_cpu_cores, 1)} CPU",
-                    "applied_display": f"{round(orig_cpu_cores, 1)} CPU",
-                    "limit_request_ratio": base_ratio,
-                    "reason": f"Current {round(act_cpu_cores, 1)} CPU is {base_ratio}x the original baseline {round(orig_cpu_cores, 1)} CPU",
                 })
 
             # Skip mismatch for 0-pod workloads
@@ -566,20 +539,6 @@ def analyze_recommendations(
                         "actual_memory_gib": round(act_mem_gib, 1),
                         "rec_display": fmt_mem(rec_mem_gib),
                         "applied_display": fmt_mem(act_mem_gib),
-                        "diff_pct": round(pct, 1),
-                        "pod_count": pod_count,
-                    })
-            if act_cpu_cores and rec_cpu_cores:
-                pct = abs(rec_cpu_cores - act_cpu_cores) / act_cpu_cores * 100
-                abs_delta = abs(rec_cpu_cores - act_cpu_cores)
-                if pct > thresholds.recommendation_mismatch_pct and abs_delta >= thresholds.mismatch_min_cpu_cores:
-                    mismatches.append({
-                        "workload": wl_key, "container": c_name, "woop": woop_tag,
-                        "apply_type": apply_type,
-                        "recommended_cpu_cores": round(rec_cpu_cores, 1),
-                        "actual_cpu_cores": round(act_cpu_cores, 1),
-                        "rec_display": f"{round(rec_cpu_cores, 2)} CPU",
-                        "applied_display": f"{round(act_cpu_cores, 2)} CPU",
                         "diff_pct": round(pct, 1),
                         "pod_count": pod_count,
                     })
