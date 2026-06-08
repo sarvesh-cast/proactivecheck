@@ -1807,6 +1807,7 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
                 "workload": m["workload"],
                 "container": m["container"],
                 "usage_bytes": m["usage_bytes"],
+                "usage_mib": round(m["usage_bytes"] / (1024 * 1024), 1),
             }
             for m in mem_usage
         ]
@@ -2268,10 +2269,14 @@ result = {{"candidates": candidates, "data_gaps": data_gaps, "summary": summary}
         erroring = resp.get("workloads", [])
         if erroring:
             errors = []
+            seen_keys: set[str] = set()
             for wl in erroring:
                 wl_ns = wl.get("workloadNamespace") or wl.get("namespace") or ""
                 wl_name = wl.get("workloadName") or wl.get("name") or ""
                 wl_key = f"{wl_ns}/{wl_name}"
+                if wl_key in seen_keys:
+                    continue  # dedup: same workload can appear multiple times
+                seen_keys.add(wl_key)
                 error_msg = wl.get("error", wl.get("errorMessage", "unknown error"))
                 errors.append({"workload": wl_key, "error": str(error_msg)[:200]})
             snapshot.log_signals.append({

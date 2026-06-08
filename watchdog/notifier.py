@@ -128,18 +128,22 @@ class Notifier:
             logger.warning("No Slack webhook URL configured, skipping notification")
             return
 
-        # Check if it's time for daily summary
+        # Check if it's time for daily summary (once per day per cluster)
         now = datetime.now(timezone.utc)
-        if now.hour == self.config.slack.daily_summary_hour_utc and now.minute < 6:
+        if (now.hour == self.config.slack.daily_summary_hour_utc
+                and now.minute < 6
+                and self.state.should_post_daily_summary()):
             await self._post_daily_summary(result, dry_run)
+            self.state.record_daily_summary()
 
         # Only post for actionable findings
         if not result.has_actionable_findings():
             logger.info("Verdict: HEALTHY — no notification needed")
             return
 
-        # Filter findings through dedup
+        # Filter findings through dedup (check only — don't record yet)
         new_findings = []
+        dedup_keys = []
         for finding in result.findings:
             if finding.severity == Severity.INFO:
                 continue  # don't post info-level findings
@@ -147,7 +151,7 @@ class Notifier:
             key = DedupKey.from_finding(finding)
             if self.state.should_notify(key, self.dedup_minutes):
                 new_findings.append(finding)
-                self.state.record_notification(key)
+                dedup_keys.append(key)
             else:
                 logger.info("Deduplicated: %s on %s", finding.category, finding.workload)
 
@@ -160,9 +164,21 @@ class Notifier:
 
         if dry_run:
             logger.info("[DRY RUN] Would post to Slack:\n%s", json.dumps(message, indent=2))
+            # Record dedup on dry-run so repeated dry-runs behave realistically
+            for key in dedup_keys:
+                self.state.record_notification(key)
             return
 
-        await self._post_to_slack(message)
+        posted = await self._post_to_slack(message)
+        if posted:
+            # Only record dedup after successful Slack delivery
+            for key in dedup_keys:
+                self.state.record_notification(key)
+        else:
+            logger.warning(
+                "Slack post failed — %d findings will be retried next cycle",
+                len(new_findings),
+            )
 
     def _cluster_header(self) -> str:
         """Return a formatted cluster identifier: name + short ID."""
@@ -262,12 +278,12 @@ class Notifier:
         console = self._console_link()
         cluster_label = self.config.cluster.cluster_name or self.config.cluster.cluster_id[:8]
 
-        # Format timestamp as short UTC time (e.g. "15:14 UTC")
+        # Format timestamp with full date (e.g. "2026-06-08 15:14 UTC")
         ts_short = ""
         if evaluated_at:
             try:
                 dt = datetime.fromisoformat(evaluated_at.replace("Z", "+00:00"))
-                ts_short = dt.strftime("%H:%M UTC")
+                ts_short = dt.strftime("%Y-%m-%d %H:%M UTC")
             except (ValueError, AttributeError):
                 ts_short = ""
 
@@ -546,13 +562,16 @@ class Notifier:
         rows: list[str] = []
 
         if cat_key == FindingCategory.ABSURD_RECOMMENDATION.value:
-            cap_findings = [(f, ev) for f, ev in parsed if ev.get("sub_type") != "ratio_breach"]
+            cap_findings = [(f, ev) for f, ev in parsed if ev.get("sub_type") == "cap_breach"]
             ratio_findings = [(f, ev) for f, ev in parsed if ev.get("sub_type") == "ratio_breach"]
+            baseline_findings = [(f, ev) for f, ev in parsed if ev.get("sub_type") == "baseline_ratio_breach"]
 
             if cap_findings:
                 rows.append(self._render_cap_breaches(sev_emoji, cluster_name, cap_findings))
             if ratio_findings:
                 rows.append(self._render_ratio_breaches(sev_emoji, cluster_name, ratio_findings))
+            if baseline_findings:
+                rows.append(self._render_baseline_breaches(sev_emoji, cluster_name, baseline_findings))
 
         elif cat_key == FindingCategory.MISMATCH.value:
             rows.append(self._render_mismatches(sev_emoji, cluster_name, parsed))
@@ -636,6 +655,47 @@ class Notifier:
             "→ A large ratio means WOOP thinks the workload needs much more than it currently requests. "
             "Check workload metrics in CAST AI Console → WOOP → select the workload. "
             "If the spike is from an outlier pod, consider switching from Max Usage to a percentile-based strategy."
+        )
+        return f"{header}{table}{overflow}\n_{action}_"
+
+    def _render_baseline_breaches(
+        self, sev_emoji: str, cluster: str,
+        items: list[tuple[Finding, dict]],
+    ) -> str:
+        header = (
+            f"{sev_emoji} *Baseline Drift* "
+            f"(applied ≥ {self.config.thresholds.outlier_median_ratio:.0f}x original baseline) "
+            f"— {len(items)} finding(s) on `{cluster}`"
+            f"\n_Current resources have drifted far from the original workload spec_\n"
+        )
+        groups = self._group_by_workload_name(items)
+        rows = []
+        for wl_name, group in list(groups.items())[:10]:
+            nss = sorted(set(self._workload_ns(f.workload) for f, _ in group))
+            ns_str = self._fmt_ns_col(nss)
+            ratios = [ev.get("limit_request_ratio", 0) for _, ev in group]
+            min_r, max_r = min(ratios), max(ratios)
+            ratio_str = f"{min_r}x" if min_r == max_r else f"{min_r}-{max_r}x"
+            sample_ev = group[0][1]
+            app_d = sample_ev.get("rec_display", "?")  # rec_display holds current applied for baseline
+            orig_d = sample_ev.get("applied_display", "?")  # applied_display holds original baseline
+            rows.append([
+                wl_name,
+                ns_str,
+                app_d,
+                orig_d,
+                ratio_str,
+            ])
+        table = self._make_table(
+            ["Workload", "Namespace(s)", "Current", "Original", "Drift"],
+            rows,
+        )
+        remaining = len(groups) - 10
+        overflow = f"\n_+{remaining} more workload types_" if remaining > 0 else ""
+        action = (
+            "→ WOOP has gradually increased resources far beyond the original spec. "
+            "Review whether the workload genuinely needs this much or if a compounding recommendation loop is at play. "
+            "Consider resetting to a known-good baseline."
         )
         return f"{header}{table}{overflow}\n_{action}_"
 
@@ -725,6 +785,11 @@ class Notifier:
             if isinstance(ev, list):
                 ev = ev[0] if ev else {}
 
+            # Trend finding (cluster-level, no pod data) — skip table row
+            if ev.get("is_trend"):
+                causes.append(f"• {f.what}")
+                continue
+
             # OOM rate: prefer _oom_rate_1h (computed by evaluator),
             # then oom_events_1h (WOOP events API), then restart_count (raw)
             oom_rate = ev.get("_oom_rate_1h")
@@ -767,13 +832,14 @@ class Notifier:
         table = self._make_table(
             ["Workload", "Container", "OOMs/1h", "Limit → Rec"],
             rows,
-        )
+        ) if rows else ""
         if len(findings) > 15:
             causes.append(f"_+{len(findings) - 15} more_")
         cause_text = "\n".join(causes[:5])
         if len(causes) > 5:
             cause_text += f"\n_+{len(causes) - 5} more causes_"
-        return f"{header}{table}\n*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
+        table_section = f"{table}\n" if table else ""
+        return f"{header}{table_section}*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
 
     def _render_crashloop_table(
         self, sev_emoji: str, cluster: str, findings: list[Finding],
@@ -841,8 +907,10 @@ class Notifier:
             ev = self._parse_evidence(f)
             if isinstance(ev, list):
                 ev = {"agent_pods": ev}
+
             agent_pods = ev.get("agent_pods", [])
-            restarts_hr = str(ev.get("restarts_last_hour", "?"))
+            restarts_hr = ev.get("restarts_last_hour") or ev.get("agent_restarts_delta")
+
             if agent_pods:
                 for pod in agent_pods[:5]:
                     name = pod.get("name", "?")
@@ -851,9 +919,26 @@ class Notifier:
                     seen_pods.add(name)
                     phase = pod.get("phase", "?")
                     rc = str(pod.get("restart_count", 0))
-                    rows.append([name, phase, rc, f"{restarts_hr}/hr"])
+                    rate = f"{restarts_hr}/hr" if restarts_hr is not None else f"{rc}/hr"
+                    rows.append([name, phase, rc, rate])
+            elif ev.get("name") or ev.get("phase"):
+                # Single agent pod dict (phase-check or ExitCode:0 finding)
+                name = ev.get("name", f.workload)
+                if name not in seen_pods:
+                    seen_pods.add(name)
+                    phase = ev.get("phase", "?")
+                    rc = str(ev.get("restart_count", 0))
+                    rows.append([name, phase, rc, "-"])
+            elif ev.get("stale_minutes") is not None:
+                # Stale heartbeat finding
+                stale = ev.get("stale_minutes", "?")
+                hb = ev.get("last_heartbeat", "?")
+                rows.append([f.workload, f"stale {stale:.0f}m" if isinstance(stale, (int, float)) else str(stale), "-", "-"])
+            elif restarts_hr is not None:
+                # Restart delta finding (no pod detail)
+                rows.append([f.workload, "-", "-", f"{restarts_hr}/hr"])
             else:
-                rows.append([f.workload, "?", "?", f"{restarts_hr}/hr"])
+                rows.append([f.workload, "?", "?", "?"])
             causes.append(f"• {f.what}")
 
         table = self._make_table(["Pod", "Phase", "Restarts", "Rate"], rows)
@@ -916,18 +1001,19 @@ class Notifier:
             if isinstance(ev, list):
                 ev = ev[0] if ev else {}
             wl = f.workload
-            container = ev.get("container", "-")
-            usage = ev.get("usage_bytes") or ev.get("usage_mib") or ev.get("request_mem_mib", "")
-            request = ev.get("request_bytes") or ev.get("request_mem_mib", "")
+            trend = ev.get("trend_mib", [])
+            growth = ev.get("growth_pct", "?")
+            current_mib = f"{trend[-1]:.0f} MiB" if trend else "?"
+            trend_str = " → ".join(f"{v:.0f}" for v in trend[-4:]) if trend else "?"
             rows.append([
                 wl,
-                container,
-                self._fmt_bytes(usage),
-                self._fmt_bytes(request),
+                current_mib,
+                f"+{growth}%" if isinstance(growth, (int, float)) else str(growth),
+                trend_str,
             ])
             causes.append(f"• `{wl}`: {f.what}")
 
-        table = self._make_table(["Workload", "Container", "Usage", "Request"], rows)
+        table = self._make_table(["Workload", "Current", "Growth", "Trend (MiB)"], rows)
         cause_text = "\n".join(causes[:5])
         return f"{header}{table}\n*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
 
@@ -965,22 +1051,28 @@ class Notifier:
         )
         rows = []
         causes = []
+        has_signal_type = False  # tracks whether any finding has a signal type vs just workload errors
         for f in findings[:10]:
             ev = self._parse_evidence(f)
             if isinstance(ev, list):
+                has_signal_type = True
                 for sig in ev[:5]:
                     signal = sig.get("signal", "?")
                     detail = sig.get("message", sig.get("detail", "-"))
                     rows.append([signal, str(detail)])
             elif isinstance(ev, dict) and ev:
                 # WOOP workload error: {"workload": "...", "error": "..."}
-                detail = ev.get("error", ev.get("message", "-"))
-                rows.append([f.workload, str(detail)[:80]])
+                error_msg = ev.get("error", ev.get("message", "-"))
+                # Use short workload name (strip namespace) to leave room for error text
+                wl_short = f.workload.rsplit("/", 1)[-1] if "/" in f.workload else f.workload
+                rows.append([wl_short, str(error_msg)])
             else:
                 rows.append([f.workload, "-"])
             causes.append(f"• {f.what}")
 
-        table = self._make_table(["Signal", "Detail"], rows)
+        col1 = "Signal" if has_signal_type else "Workload"
+        col2 = "Detail" if has_signal_type else "Error"
+        table = self._make_table([col1, col2], rows)
         cause_text = "\n".join(causes[:3])
         return f"{header}{table}\n*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
 
@@ -997,13 +1089,19 @@ class Notifier:
         for f in findings[:15]:
             ev = self._parse_evidence(f)
             if isinstance(ev, dict) and ev:
-                ns = ev.get("namespace", "")
-                name = ev.get("name", "")
-                label = f"{ns}/{name}" if ns and name else f.workload
-                desired = ev.get("desired", "?")
-                ready = ev.get("ready", ev.get("readyReplicas", "?"))
-                avail = ev.get("available", ev.get("availableReplicas", "?"))
-                rows.append([label, str(desired), str(ready), str(avail)])
+                # STARTUP_FAILURE evidence has "workload" + "count" but no desired/ready/available
+                if "desired" in ev or "ready" in ev or "namespace" in ev:
+                    ns = ev.get("namespace", "")
+                    name = ev.get("name", "")
+                    label = f"{ns}/{name}" if ns and name else f.workload
+                    desired = ev.get("desired", "?")
+                    ready = ev.get("ready", ev.get("readyReplicas", "?"))
+                    avail = ev.get("available", ev.get("availableReplicas", "?"))
+                    rows.append([label, str(desired), str(ready), str(avail)])
+                else:
+                    # Startup failure or other event-based finding — skip table row,
+                    # it will show in the Analysis section via f.what
+                    pass
             elif isinstance(ev, list):
                 for p in ev[:5]:
                     ns = p.get("namespace", "")
@@ -1014,13 +1112,14 @@ class Notifier:
                 rows.append([f.workload, "?", "?", "?"])
             causes.append(f"• `{f.workload}`: {f.what}")
 
-        table = self._make_table(["Deployment", "Desired", "Ready", "Available"], rows)
+        table = self._make_table(["Deployment", "Desired", "Ready", "Available"], rows) if rows else ""
         if len(findings) > 15:
             causes.append(f"_+{len(findings) - 15} more_")
         cause_text = "\n".join(causes[:5])
         if len(causes) > 5:
             cause_text += f"\n_+{len(causes) - 5} more_"
-        return f"{header}{table}\n*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
+        table_section = f"{table}\n" if table else ""
+        return f"{header}{table_section}*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
 
     def _render_generic_table(
         self, sev_emoji: str, cluster: str, cat_key: str, findings: list[Finding],
@@ -1056,8 +1155,11 @@ class Notifier:
         # Sort by count descending so worst offenders show first
         return dict(sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True))
 
-    async def _post_to_slack(self, message: dict) -> None:
-        """POST message to Slack webhook with error handling."""
+    async def _post_to_slack(self, message: dict) -> bool:
+        """POST message to Slack webhook with error handling.
+
+        Returns True on success, False on failure (timeout, HTTP error, etc.).
+        """
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(self.webhook_url, json=message)
@@ -1067,12 +1169,15 @@ class Notifier:
                         resp.status_code,
                         resp.text[:200],
                     )
-                else:
-                    logger.info("Posted to Slack successfully")
+                    return False
+                logger.info("Posted to Slack successfully")
+                return True
         except httpx.TimeoutException:
             logger.error("Slack webhook timed out — will retry next cycle")
+            return False
         except Exception as e:
             logger.error("Failed to post to Slack: %s", e)
+            return False
 
     # ── App execution failure alerts (admin channel) ─────────────
 
@@ -1106,7 +1211,7 @@ class Notifier:
         if not self.state.should_notify(dedup_key, self.dedup_minutes):
             logger.info("Admin alert deduplicated: %s on %s", phase, cluster_id or "global")
             return
-        self.state.record_notification(dedup_key)
+        # NOTE: dedup recorded AFTER successful post (below), not here
 
         admin_url = self.config.slack.admin_webhook_url
         if not admin_url and not dry_run:
@@ -1170,15 +1275,23 @@ class Notifier:
 
         if dry_run:
             logger.info("[DRY RUN] Would post app error to admin Slack:\n%s", json.dumps(message, indent=2))
+            self.state.record_notification(dedup_key)
             return
 
-        await self._post_to_admin_slack(message)
+        posted = await self._post_to_admin_slack(message)
+        if posted:
+            self.state.record_notification(dedup_key)
+        else:
+            logger.warning("Admin Slack post failed — app error alert will be retried next cycle")
 
-    async def _post_to_admin_slack(self, message: dict) -> None:
-        """POST message to admin Slack webhook with error handling."""
+    async def _post_to_admin_slack(self, message: dict) -> bool:
+        """POST message to admin Slack webhook with error handling.
+
+        Returns True on success, False on failure.
+        """
         admin_url = self.config.slack.admin_webhook_url
         if not admin_url:
-            return
+            return False
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(admin_url, json=message)
@@ -1188,9 +1301,12 @@ class Notifier:
                         resp.status_code,
                         resp.text[:200],
                     )
-                else:
-                    logger.info("Posted app error to admin Slack successfully")
+                    return False
+                logger.info("Posted app error to admin Slack successfully")
+                return True
         except httpx.TimeoutException:
             logger.error("Admin Slack webhook timed out")
+            return False
         except Exception as e:
             logger.error("Failed to post to admin Slack: %s", e)
+            return False

@@ -18,6 +18,14 @@ from typing import Any
 logger = logging.getLogger("watchdog.snapshot_health")
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """Parse a value to int, returning default on failure."""
+    try:
+        return int(value or default)
+    except (ValueError, TypeError):
+        return default
+
+
 # ── Unit parsers ─────────────────────────────────────────────────────────
 
 def parse_cpu_millicores(value: str) -> int:
@@ -270,7 +278,7 @@ def analyze_node_health(nodes: list[dict]) -> dict[str, Any]:
             "alloc_mem_bytes": a_mem,
             "cap_cpu_m": c_cpu,
             "cap_mem_bytes": c_mem,
-            "max_pods": int(alloc.get("pods", "0") or "0"),
+            "max_pods": _safe_int(alloc.get("pods", "0")),
         })
 
     return {

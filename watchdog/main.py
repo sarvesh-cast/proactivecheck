@@ -337,11 +337,17 @@ class Watchdog:
 
         # Alert admin on partial collection failures (e.g. MCP timeout, API 403)
         if snapshot.collection_errors:
+            # Put actual error details in the error field, not just a count
+            error_details = "\n".join(
+                f"• {err}" for err in snapshot.collection_errors[:5]
+            )
+            if len(snapshot.collection_errors) > 5:
+                error_details += f"\n… +{len(snapshot.collection_errors) - 5} more"
             await self.notifier.notify_app_error(
-                "collector", f"{len(snapshot.collection_errors)} partial collection error(s)",
+                "collector", error_details,
                 cluster_id=self.config.cluster.cluster_id,
                 cluster_name=self.config.cluster.cluster_name,
-                context="; ".join(snapshot.collection_errors[:5]),
+                context=f"{len(snapshot.collection_errors)} partial failure(s) — evaluation proceeded with available data",
                 dry_run=self.config.dry_run,
             )
 
@@ -471,6 +477,12 @@ class Watchdog:
 
             # Push to rolling window (builds up state across timestamps)
             self.state.push_snapshot(snapshot.to_dict_compact())
+
+            # Compute per-interval OOMKill deltas (same as run_once)
+            snapshot.oomkilled_pods = self.state.compute_oomkill_deltas(
+                list(snapshot.oomkilled_pods)
+            )
+
             self.state.update_data_gaps(snapshot.data_gaps)
             self.state.update_pending_pods(snapshot.pending_pods_detail)
 
@@ -788,8 +800,12 @@ class Watchdog:
                     category=FindingCategory.OOMKILL,
                     workload="test-namespace/test-workload",
                     what="OOMKill spiral detected (test)",
-                    evidence="6 OOMKills in the last hour (3x threshold); "
-                             "Memory limit is 128 MiB but workload needs ~1.2 GiB",
+                    evidence=json.dumps({
+                        "namespace": "test-namespace", "name": "test-workload",
+                        "container": "main", "restart_count": 6,
+                        "_oom_rate_1h": 6.0, "mem_limit": "128Mi",
+                        "last_oomkill_time": "2026-01-01T00:00:00Z",
+                    }),
                     suggested_action="Disable WOOP for this workload immediately",
                 ),
                 Finding(
@@ -797,7 +813,10 @@ class Watchdog:
                     category=FindingCategory.AGENT_RESTART,
                     workload="castai-agent/castai-agent-pod-abc",
                     what="CAST AI agent restart count elevated (test)",
-                    evidence="restartCount=2 in last hour",
+                    evidence=json.dumps({
+                        "agent_restarts_delta": 2,
+                        "agent_pods": [{"name": "castai-agent-pod-abc", "phase": "Running", "restart_count": 2}],
+                    }),
                     suggested_action="Monitor — will escalate to CRITICAL at 3/hour",
                 ),
             ],
@@ -992,7 +1011,7 @@ async def _run_multi_loop(base_config: WatchdogConfig, clusters: list[dict], arg
             if shutdown:
                 break
             cid, cname = cl["id"], cl["name"]
-            cfg = _config_for_cluster(base_config, cid, cname) if is_multi else base_config
+            cfg = _config_for_cluster(base_config, cid, cname)
             if is_multi:
                 logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
             force_tier = getattr(args, "force_tier", None)

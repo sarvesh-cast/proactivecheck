@@ -60,7 +60,8 @@ Known fragile components (extra scrutiny):
 ## Your Task
 
 Analyze the following snapshot and trailing history. Produce a JSON
-response with this exact structure:
+response with this exact structure. Do NOT include any preamble,
+explanation, or <think> tags — output ONLY the JSON object:
 
 {{{{
   "verdict": "HEALTHY" | "WARNING" | "CRITICAL",
@@ -350,6 +351,9 @@ class Evaluator:
 
     def _parse_llm_json(self, text: str) -> dict | None:
         """Extract JSON from LLM response, handling markdown fences, preamble, and partial output."""
+        # Strip reasoning/thinking tags (minimax, deepseek, etc.)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
         # Try 1: direct parse
         try:
             return json.loads(text)
@@ -570,7 +574,7 @@ class Evaluator:
                     category=FindingCategory.OOMKILL,
                     workload="cluster-level",
                     what=f"OOMKill count escalating across {len(recent)} snapshots: {recent}",
-                    evidence=f"oomkill_trend={trend}",
+                    evidence=json.dumps({"oomkill_trend": trend, "recent": recent, "is_trend": True}),
                     suggested_action="OOMKill spiral detected — investigate affected workloads immediately",
                 ))
 
@@ -608,7 +612,7 @@ class Evaluator:
                     category=FindingCategory.UNSCHEDULABLE,
                     workload="cluster-level",
                     what=f"+{remaining} more pod(s) Pending >15 min",
-                    evidence=f"total_mature_pending={len(m_pending)}",
+                    evidence=json.dumps({"total_mature_pending": len(m_pending)}),
                     suggested_action="Review all stuck Pending pods in console",
                 ))
         elif snapshot.pending_pods > 0:
@@ -670,7 +674,7 @@ class Evaluator:
                     category=FindingCategory.DATA_GAP,
                     workload="cluster-level",
                     what=f"+{remaining} more MANAGED workload(s) with no recommendation for >2 hours",
-                    evidence=f"total_mature_data_gaps={len(mgaps)}",
+                    evidence=json.dumps({"total_mature_data_gaps": len(mgaps)}),
                     suggested_action="Review all data gaps in console",
                 ))
         elif snapshot.data_gaps:
@@ -692,7 +696,7 @@ class Evaluator:
                     category=FindingCategory.DATA_GAP,
                     workload="cluster-level",
                     what=f"+{remaining} more MANAGED workload(s) with no recommendation (< 2 hours)",
-                    evidence=f"total_fresh_data_gaps={len(snapshot.data_gaps)}",
+                    evidence=json.dumps({"total_fresh_data_gaps": len(snapshot.data_gaps)}),
                     suggested_action="Monitor — will escalate if gap persists",
                 ))
 
@@ -704,7 +708,7 @@ class Evaluator:
                 category=FindingCategory.MEMORY_LEAK,
                 workload=f"{leak.get('namespace', '?')}/{leak.get('workload', '?')}",
                 what=f"Memory request increasing across {len(leak.get('trend_mib', []))} snapshots (+{leak.get('growth_pct', '?')}%)",
-                evidence=f"trend_mib={leak.get('trend_mib', [])}",
+                evidence=json.dumps(leak),
                 suggested_action="Investigate application memory growth; may trigger OOM recovery compounding",
             ))
 
@@ -729,7 +733,7 @@ class Evaluator:
                 category=FindingCategory.AGENT_RESTART,
                 workload="castai-agent",
                 what=f"CAST AI agent(s) restarted {agent_restarts_last_hour} times in the last hour",
-                evidence=f"agent_restarts_delta={agent_restarts_last_hour}",
+                evidence=json.dumps({"agent_restarts_delta": agent_restarts_last_hour}),
                 suggested_action="Check agent logs for crash loops or silent ExitCode:0 failures",
             ))
         # 1-2 restarts/hr is normal operational behavior — don't alert
@@ -778,7 +782,7 @@ class Evaluator:
                 category=FindingCategory.CASCADING_SCALING,
                 workload="cluster-level",
                 what=f"Node count spiked {node_count_delta_pct:+.0f}% vs. trailing average",
-                evidence=f"node_count={snapshot.node_count}, delta_pct={node_count_delta_pct:.1f}%",
+                evidence=json.dumps({"node_count": snapshot.node_count, "node_count_delta_pct": round(node_count_delta_pct, 1), "total_pods": snapshot.total_pods, "pod_count_delta_pct": round(pod_count_delta_pct, 1)}),
                 suggested_action="Check for runaway autoscaler or cascading scaling event",
             ))
         if pod_count_delta_pct > t.node_count_spike_pct:
@@ -788,7 +792,7 @@ class Evaluator:
                 category=FindingCategory.CASCADING_SCALING,
                 workload="cluster-level",
                 what=f"Pod count spiked {pod_count_delta_pct:+.0f}% vs. trailing average",
-                evidence=f"total_pods={snapshot.total_pods}, delta_pct={pod_count_delta_pct:.1f}%",
+                evidence=json.dumps({"node_count": snapshot.node_count, "node_count_delta_pct": round(node_count_delta_pct, 1), "total_pods": snapshot.total_pods, "pod_count_delta_pct": round(pod_count_delta_pct, 1)}),
                 suggested_action="Check for unexpected deployment scaling or pod storm",
             ))
 
@@ -811,7 +815,7 @@ class Evaluator:
                     category=FindingCategory.CRASHLOOP,
                     workload="cluster-level",
                     what=f"+{remaining} more pod(s) in CrashLoopBackOff",
-                    evidence=f"crashloop_pods={snapshot.crashloop_pods}",
+                    evidence=json.dumps({"crashloop_pods": snapshot.crashloop_pods}),
                     suggested_action="Review all CrashLooping pods in console",
                 ))
         elif snapshot.crashloop_pods > 0:
@@ -822,7 +826,7 @@ class Evaluator:
                 category=FindingCategory.CRASHLOOP,
                 workload="cluster-level",
                 what=f"{snapshot.crashloop_pods} pod(s) in CrashLoopBackOff",
-                evidence=f"crashloop_pods={snapshot.crashloop_pods}",
+                evidence=json.dumps({"crashloop_pods": snapshot.crashloop_pods}),
                 suggested_action="Investigate CrashLooping pods — all replicas may be down",
             ))
 
@@ -844,7 +848,7 @@ class Evaluator:
                     category=FindingCategory.AGENT,
                     workload="castai-agent/castai-agent",
                     what=f"Agent heartbeat stale for {stale_min:.0f} minutes",
-                    evidence=f"last_heartbeat={sig.get('last_heartbeat')}",
+                    evidence=json.dumps({"last_heartbeat": sig.get("last_heartbeat"), "stale_minutes": stale_min}),
                     suggested_action="Agent may be down or stuck — check castai-agent pod logs",
                 ))
 
@@ -870,15 +874,37 @@ class Evaluator:
                 for wl_err in sig.get("workloads", [])[:5]:
                     wl_key = wl_err.get("workload", "unknown")
                     err_msg = wl_err.get("error", "unknown")
-                    sev = Severity.CRITICAL if "cluster-controller" in err_msg.lower() else Severity.WARNING
+                    err_lower = err_msg.lower()
+
+                    # Classify error: recommendation timeout vs webhook vs generic
+                    if "timed out" in err_lower and "recommendation" in err_lower:
+                        sev = Severity.WARNING
+                        what = f"Recommendation creation timed out — cluster-controller may be overloaded"
+                        action = (
+                            "Check cluster-controller pod health and resource usage; "
+                            "recommendation will retry on next cycle"
+                        )
+                    elif "webhook" in err_lower or "admission" in err_lower:
+                        sev = Severity.CRITICAL
+                        what = f"Admission webhook error: {err_msg[:80]}"
+                        action = "Check WA admission webhook health; pods may not get correct resources on restart"
+                    elif "cluster-controller" in err_lower:
+                        sev = Severity.CRITICAL
+                        what = f"Cluster-controller error: {err_msg[:80]}"
+                        action = "Check cluster-controller pod health and logs"
+                    else:
+                        sev = Severity.WARNING
+                        what = f"WOOP reports error: {err_msg[:100]}"
+                        action = "Check cluster-controller and admission webhook health"
+
                     _escalate(sev)
                     findings.append(Finding(
                         severity=sev,
                         category=FindingCategory.WEBHOOK_FAILURE,
                         workload=wl_key,
-                        what=f"WOOP reports error: {err_msg[:100]}",
+                        what=what,
                         evidence=json.dumps(wl_err),
-                        suggested_action="Check cluster-controller and admission webhook health",
+                        suggested_action=action,
                     ))
 
         # ── Unhealthy deployments (from log_signals) ─────────────────

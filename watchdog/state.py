@@ -44,6 +44,7 @@ class StateManager:
             data.setdefault("dedup_log", {})
             data.setdefault("data_gap_first_seen", {})
             data.setdefault("pending_pod_first_seen", {})
+            data.setdefault("last_daily_summary_date", "")
             return data
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.warning("State file corrupted (%s), resetting: %s", self.state_file, e)
@@ -55,6 +56,7 @@ class StateManager:
             "dedup_log": {},  # {dedup_key_str: last_posted_iso}
             "data_gap_first_seen": {},  # {"ns/workload": iso_timestamp}
             "pending_pod_first_seen": {},  # {"ns/pod_name": iso_timestamp}
+            "last_daily_summary_date": "",  # "YYYY-MM-DD" — prevents double-posting
         }
 
     def save(self) -> None:
@@ -102,9 +104,10 @@ class StateManager:
         return [s.get("node_count", 0) for s in self._state["snapshots"]]
 
     def get_workload_memory_trend(self, namespace: str, workload: str) -> list[float]:
-        """Return memory request (MiB) for a specific workload across snapshots.
+        """Return memory (MiB) for a specific workload across snapshots.
 
-        Uses workload_memory_usage collected from woop_get_workload_resource_ratios.
+        Prefers usage_mib (actual usage from pod metrics, hybrid tier) over
+        request_mem_mib (WOOP resource ratios, MCP/API tiers).
         If monotonically increasing across 3+ snapshots, it's a potential leak.
         """
         values = []
@@ -113,7 +116,8 @@ class StateManager:
             for entry in snap.get("workload_memory_usage", []):
                 if (entry.get("namespace") == namespace
                         and entry.get("workload") == workload):
-                    values.append(entry.get("request_mem_mib", 0))
+                    mib = entry.get("usage_mib") or entry.get("request_mem_mib", 0)
+                    values.append(mib)
                     found = True
                     break
             if not found:
@@ -309,7 +313,7 @@ class StateManager:
         # Build lookup: pod_key → restart_count from previous snapshot
         prev_restarts: dict[str, int] = {}
         for o in prev.get("oomkilled_pods", []):
-            if o.get("source") == "snapshot_lastState":
+            if o.get("source", "").startswith("snapshot_"):
                 ns = o.get("namespace", "")
                 name = o.get("name", "")
                 key = f"{ns}/{name}"
@@ -317,7 +321,7 @@ class StateManager:
 
         result = []
         for o in current_oom:
-            if o.get("source") != "snapshot_lastState":
+            if not o.get("source", "").startswith("snapshot_"):
                 # WOOP/API-sourced — already time-windowed
                 result.append(o)
                 continue
@@ -464,3 +468,12 @@ class StateManager:
             except (ValueError, TypeError):
                 pass  # drop corrupt entries
         self._state["dedup_log"] = cleaned
+
+    def should_post_daily_summary(self) -> bool:
+        """Return True if no daily summary has been posted today (UTC)."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return self._state.get("last_daily_summary_date", "") != today
+
+    def record_daily_summary(self) -> None:
+        """Record that the daily summary was posted today."""
+        self._state["last_daily_summary_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
