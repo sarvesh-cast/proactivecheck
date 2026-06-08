@@ -51,13 +51,36 @@ CATEGORY_DESCRIPTION: dict[str, str] = {}
 
 
 class Notifier:
-    """Posts evaluation results to Slack with deduplication."""
+    """Posts evaluation results to Slack with deduplication and batch buffering.
+
+    Batch mode (notify_batch_cycles > 1):
+        buffer_findings() is called every eval cycle — it dedup-checks and
+        accumulates actionable findings in an in-memory buffer.
+        flush() is called every N cycles — it merges all buffered findings
+        into a single Slack message, posts it, and records dedup keys only
+        on successful delivery.  If flush fails, the buffer is preserved and
+        keys are NOT recorded, so findings retry on the next flush.
+
+    Non-batch mode (notify_batch_cycles == 1):
+        notify() works exactly as before — post immediately each cycle.
+
+    Daily summary and app errors always bypass the buffer.
+    """
 
     def __init__(self, config: WatchdogConfig, state: StateManager) -> None:
         self.config = config
         self.state = state
         self.webhook_url = config.slack.webhook_url
         self.dedup_minutes = config.slack.dedup_window_minutes
+
+        # ── Batch buffer state ──
+        self._finding_buffer: list[Finding] = []
+        self._buffer_dedup_keys: list[DedupKey] = []
+        self._buffer_keys_set: set[str] = set()  # for within-window dedup
+        self._latest_verdict: Verdict = Verdict.HEALTHY
+        self._latest_summary: str = ""
+        self._latest_eval_at: str = ""
+
         # Build config-aware descriptions so alerts explain the exact trigger condition
         self._build_category_descriptions()
 
@@ -179,6 +202,129 @@ class Notifier:
                 "Slack post failed — %d findings will be retried next cycle",
                 len(new_findings),
             )
+
+    async def buffer_findings(self, result: EvaluationResult, dry_run: bool = False) -> int:
+        """Buffer actionable findings from one eval cycle for later flush.
+
+        Performs dedup check (state-level cross-window) and within-buffer
+        dedup (same category+workload already buffered this window).
+
+        Also handles daily summary posting (bypasses buffer).
+
+        Returns the count of new findings added to the buffer.
+        """
+        if not self.webhook_url and not dry_run:
+            logger.warning("No Slack webhook URL configured, skipping buffer")
+            return 0
+
+        # Daily summary fires immediately regardless of batch cycle
+        now = datetime.now(timezone.utc)
+        if (now.hour == self.config.slack.daily_summary_hour_utc
+                and now.minute < 6
+                and self.state.should_post_daily_summary()):
+            await self._post_daily_summary(result, dry_run)
+            self.state.record_daily_summary()
+
+        # Track the latest/worst verdict across the batch window
+        _VERDICT_RANK = {Verdict.HEALTHY: 0, Verdict.WARNING: 1, Verdict.CRITICAL: 2}
+        if _VERDICT_RANK.get(result.verdict, 0) >= _VERDICT_RANK.get(self._latest_verdict, 0):
+            self._latest_verdict = result.verdict
+            self._latest_summary = result.summary
+        # Always update eval_at to the most recent
+        self._latest_eval_at = result.evaluated_at
+
+        if not result.has_actionable_findings():
+            logger.info("Verdict: %s — nothing to buffer", result.verdict.value)
+            return 0
+
+        added = 0
+        for finding in result.findings:
+            if finding.severity == Severity.INFO:
+                continue
+
+            key = DedupKey.from_finding(finding)
+            key_str = f"{key.category}:{key.workload}"
+
+            # Within-buffer dedup: don't add the same finding twice in one window
+            if key_str in self._buffer_keys_set:
+                logger.debug("Buffer dedup (within-window): %s", key_str)
+                continue
+
+            # Cross-window dedup via state (same as notify())
+            if not self.state.should_notify(key, self.dedup_minutes):
+                logger.info("Deduplicated (cross-window): %s on %s", finding.category, finding.workload)
+                continue
+
+            self._finding_buffer.append(finding)
+            self._buffer_dedup_keys.append(key)
+            self._buffer_keys_set.add(key_str)
+            added += 1
+
+        logger.info("Buffered %d new findings (total buffer: %d)", added, len(self._finding_buffer))
+        return added
+
+    async def flush(self, dry_run: bool = False) -> None:
+        """Flush the accumulated finding buffer to Slack.
+
+        Posts all buffered findings as a single merged message using the
+        worst verdict seen in the batch window. Records dedup keys only
+        after successful Slack delivery.
+
+        If the buffer is empty (all cycles were HEALTHY), does nothing.
+        Clears the buffer after successful flush or dry-run.
+        """
+        if not self._finding_buffer:
+            logger.info("Flush: buffer empty — nothing to post")
+            self._reset_buffer()
+            return
+
+        logger.info(
+            "Flushing %d findings (verdict=%s)",
+            len(self._finding_buffer),
+            self._latest_verdict.value,
+        )
+
+        message = self._format_message(
+            self._latest_verdict,
+            self._latest_summary,
+            self._finding_buffer,
+            self._latest_eval_at,
+        )
+
+        if dry_run:
+            logger.info("[DRY RUN] Would flush to Slack:\n%s", json.dumps(message, indent=2))
+            # Record dedup on dry-run so repeated dry-runs behave realistically
+            for key in self._buffer_dedup_keys:
+                self.state.record_notification(key)
+            self._reset_buffer()
+            return
+
+        posted = await self._post_to_slack(message)
+        if posted:
+            for key in self._buffer_dedup_keys:
+                self.state.record_notification(key)
+            self._reset_buffer()
+            logger.info("Flush: posted successfully, buffer cleared")
+        else:
+            logger.warning(
+                "Flush failed — %d findings preserved for next flush attempt",
+                len(self._finding_buffer),
+            )
+            # Do NOT clear buffer or record keys — retry next flush
+
+    def _reset_buffer(self) -> None:
+        """Clear all buffer state for the next batch window."""
+        self._finding_buffer.clear()
+        self._buffer_dedup_keys.clear()
+        self._buffer_keys_set.clear()
+        self._latest_verdict = Verdict.HEALTHY
+        self._latest_summary = ""
+        self._latest_eval_at = ""
+
+    @property
+    def buffer_size(self) -> int:
+        """Number of findings currently in the buffer."""
+        return len(self._finding_buffer)
 
     def _cluster_header(self) -> str:
         """Return a formatted cluster identifier: name + short ID."""
@@ -379,8 +525,9 @@ class Notifier:
                 rows.append(self._render_generic_table(sev_emoji, cluster_name, cat_key, group_findings))
 
         if rows:
-            # Split into chunks to stay under Slack's 3000-char section limit
-            for i in range(0, len(rows)):
+            # Slack limit: 50 blocks per message. Reserve 5 for header/summary/divider/footer.
+            max_finding_blocks = 45
+            for i in range(0, min(len(rows), max_finding_blocks)):
                 text = rows[i]
                 if len(text) > SLACK_TEXT_LIMIT:
                     text = text[:SLACK_TEXT_LIMIT - 20] + "\n_...truncated_"
@@ -388,13 +535,20 @@ class Notifier:
                     "type": "section",
                     "text": {"type": "mrkdwn", "text": text},
                 })
+            if len(rows) > max_finding_blocks:
+                blocks.append({
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"_+{len(rows) - max_finding_blocks} more finding groups not shown (Slack block limit)_"}],
+                })
 
         # Footer
         footer_parts = []
         if console:
             footer_parts.append(f"<{console}|Console>")
         footer_parts.append(datetime.now(timezone.utc).strftime("%H:%M UTC"))
-        footer_parts.append("Next in 5m")
+        batch_cycles = self.config.notify_batch_cycles
+        interval_min = (batch_cycles * self.config.run_interval_seconds) // 60
+        footer_parts.append(f"Next in {interval_min}m")
 
         blocks.append({
             "type": "context",

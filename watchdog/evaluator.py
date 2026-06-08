@@ -352,7 +352,9 @@ class Evaluator:
     def _parse_llm_json(self, text: str) -> dict | None:
         """Extract JSON from LLM response, handling markdown fences, preamble, and partial output."""
         # Strip reasoning/thinking tags (minimax, deepseek, etc.)
+        # Handle both closed <think>...</think> and unclosed <think>... (truncated)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = re.sub(r"<think>.*", "", text, flags=re.DOTALL).strip()
 
         # Try 1: direct parse
         try:

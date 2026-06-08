@@ -70,6 +70,7 @@ Environment variables:
     WATCHDOG_STATE_FILE                 — Path to state file
     WATCHDOG_LOG_LEVEL                  — Logging level (DEBUG/INFO/WARNING)
     WATCHDOG_MODEL                      — LLM model (default: kimi-k2.6)
+    WATCHDOG_NOTIFY_BATCH_CYCLES=3      — Buffer findings across N cycles before posting (default: 3 = 15 min)
 """
 
 from __future__ import annotations
@@ -303,6 +304,7 @@ class Watchdog:
         )
         self.notifier = Notifier(self.config, self.state)
         self._shutdown = False
+        self._cycle_count = 0  # batch notification counter
 
     async def run_once(self, tier_report: bool = False) -> None:
         """Execute a single collect → evaluate → notify cycle."""
@@ -416,9 +418,25 @@ class Watchdog:
             self.state.save()
             return
 
-        # ── Phase 3: Notify ───────────────────────────────────────
+        # ── Phase 3: Notify (batch or immediate) ─────────────────
+        batch_cycles = self.config.notify_batch_cycles
         try:
-            await self.notifier.notify(result, dry_run=self.config.dry_run)
+            if batch_cycles > 1:
+                # Batch mode: buffer findings, flush every N cycles
+                await self.notifier.buffer_findings(result, dry_run=self.config.dry_run)
+                self._cycle_count += 1
+                if self._cycle_count >= batch_cycles:
+                    logger.info("Batch window complete (%d cycles) — flushing", self._cycle_count)
+                    await self.notifier.flush(dry_run=self.config.dry_run)
+                    self._cycle_count = 0
+                else:
+                    logger.info(
+                        "Batch cycle %d/%d — %d findings buffered",
+                        self._cycle_count, batch_cycles, self.notifier.buffer_size,
+                    )
+            else:
+                # Immediate mode (batch_cycles == 1): post every cycle
+                await self.notifier.notify(result, dry_run=self.config.dry_run)
         except Exception as e:
             logger.error("Notification phase failed: %s", e, exc_info=True)
             # Notify admin about notification failure (ironic but important —
@@ -531,11 +549,15 @@ class Watchdog:
 
         Handles SIGINT/SIGTERM for graceful shutdown.
         """
+        batch = self.config.notify_batch_cycles
+        notify_interval = (batch * self.config.run_interval_seconds) // 60
         logger.info(
-            "Watchdog starting in %s mode | cluster=%s | interval=%ds",
+            "Watchdog starting in %s mode | cluster=%s | interval=%ds | notify every %dm (%d cycles)",
             "DRY-RUN" if self.config.dry_run else "LIVE",
             self.config.cluster.cluster_id,
             self.config.run_interval_seconds,
+            notify_interval,
+            batch,
         )
 
         # Register signal handlers for graceful shutdown
@@ -980,6 +1002,11 @@ async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
             await watchdog.run_once(
                 tier_report=getattr(args, "tier_report", False),
             )
+            # --once: flush any buffered findings before exit
+            if watchdog.notifier.buffer_size > 0:
+                logger.info("--once mode: flushing %d buffered findings before exit", watchdog.notifier.buffer_size)
+                await watchdog.notifier.flush(dry_run=cfg.dry_run)
+                watchdog.state.save()
         else:
             # Continuous loop — run all clusters each cycle
             await _run_multi_loop(base_config, clusters, args)
@@ -987,7 +1014,11 @@ async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
 
 
 async def _run_multi_loop(base_config: WatchdogConfig, clusters: list[dict], args) -> None:
-    """Continuous loop that processes all clusters each cycle."""
+    """Continuous loop that processes all clusters each cycle.
+
+    Persists Watchdog instances across cycles so batch buffers and
+    cycle counters survive between iterations.
+    """
     shutdown = False
 
     def _handle_shutdown():
@@ -999,23 +1030,33 @@ async def _run_multi_loop(base_config: WatchdogConfig, clusters: list[dict], arg
         loop.add_signal_handler(sig, _handle_shutdown)
 
     is_multi = len(clusters) > 1
+    batch = base_config.notify_batch_cycles
+    notify_min = (batch * base_config.run_interval_seconds) // 60
     logger.info(
-        "Watchdog starting | %d cluster(s) | interval=%ds | %s mode",
+        "Watchdog starting | %d cluster(s) | interval=%ds | notify every %dm (%d cycles) | %s mode",
         len(clusters),
         base_config.run_interval_seconds,
+        notify_min,
+        batch,
         "DRY-RUN" if base_config.dry_run else "LIVE",
     )
+
+    # Pre-build Watchdog instances so buffer/counter persists across cycles
+    force_tier = getattr(args, "force_tier", None)
+    watchdogs: dict[str, Watchdog] = {}
+    for cl in clusters:
+        cid, cname = cl["id"], cl["name"]
+        cfg = _config_for_cluster(base_config, cid, cname)
+        watchdogs[cid] = Watchdog(cfg, force_tier=force_tier)
 
     while not shutdown:
         for i, cl in enumerate(clusters):
             if shutdown:
                 break
             cid, cname = cl["id"], cl["name"]
-            cfg = _config_for_cluster(base_config, cid, cname)
             if is_multi:
                 logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
-            force_tier = getattr(args, "force_tier", None)
-            watchdog = Watchdog(cfg, force_tier=force_tier)
+            watchdog = watchdogs[cid]
             try:
                 await watchdog.run_once(
                     tier_report=getattr(args, "tier_report", False),

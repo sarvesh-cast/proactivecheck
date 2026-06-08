@@ -258,3 +258,7 @@ class WatchdogConfig:
     state_file: str = field(default_factory=lambda: os.getenv("WATCHDOG_STATE_FILE", "watchdog_state.json"))
     dry_run: bool = field(default_factory=lambda: os.getenv("WATCHDOG_DRY_RUN", "false").lower() == "true")
     log_level: str = field(default_factory=lambda: os.getenv("WATCHDOG_LOG_LEVEL", "INFO"))
+
+    # Batch notification: buffer findings across N eval cycles before posting.
+    # Default 3 = post every 15 min (3 × 5 min). Set to 1 to disable batching.
+    notify_batch_cycles: int = field(default_factory=lambda: max(1, int(os.getenv("WATCHDOG_NOTIFY_BATCH_CYCLES", "3"))))
