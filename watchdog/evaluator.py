@@ -250,6 +250,7 @@ class Evaluator:
             agent_restarts_last_hour, memory_leaks or [],
             mature_data_gaps or [], oomkill_trend or [],
             mature_pending_pods=mature_pending_pods or [],
+            history=history,
         )
 
         # ── LLM provides summary only; raw metrics are the single source
@@ -468,6 +469,7 @@ class Evaluator:
         mature_data_gaps: list[dict] | None = None,
         oomkill_trend: list[int] | None = None,
         mature_pending_pods: list[dict] | None = None,
+        history: list[dict] | None = None,
     ) -> EvaluationResult:
         """Produce a deterministic evaluation from raw data when LLM is unavailable.
 
@@ -871,6 +873,17 @@ class Evaluator:
                     ))
 
         # ── WOOP workload errors (webhook/controller failures) ───────
+        # Build set of workloads that had errors in the previous snapshot
+        # so we can require persistence for transient-prone error types.
+        _prev_woop_error_wls: set[str] = set()
+        if history:
+            prev = history[-1] if isinstance(history, list) else None
+            if prev:
+                for prev_sig in (prev.get("log_signals") or []):
+                    if prev_sig.get("signal") == "woop_workload_errors":
+                        for pw in prev_sig.get("workloads", []):
+                            _prev_woop_error_wls.add(pw.get("workload", ""))
+
         for sig in snapshot.log_signals:
             if sig.get("signal") == "woop_workload_errors":
                 for wl_err in sig.get("workloads", [])[:5]:
@@ -880,11 +893,18 @@ class Evaluator:
 
                     # Classify error: recommendation timeout vs webhook vs generic
                     if "timed out" in err_lower and "recommendation" in err_lower:
+                        # Transient-prone: require persistence across 2 consecutive snapshots
+                        if wl_key not in _prev_woop_error_wls:
+                            logger.debug(
+                                "Suppressing transient rec-timeout for %s (not in previous snapshot)",
+                                wl_key,
+                            )
+                            continue
                         sev = Severity.WARNING
-                        what = f"Recommendation creation timed out — cluster-controller may be overloaded"
+                        what = f"Recommendation creation timed out — cluster-controller may be overloaded (persistent)"
                         action = (
                             "Check cluster-controller pod health and resource usage; "
-                            "recommendation will retry on next cycle"
+                            "error persisted across consecutive snapshots"
                         )
                     elif "webhook" in err_lower or "admission" in err_lower:
                         sev = Severity.CRITICAL

@@ -1,0 +1,25 @@
+[Unit]
+Description=CAST AI Watchdog Monitor (Grip Security)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sarveshanand
+Group=sarveshanand
+WorkingDirectory=/home/sarveshanand/proactivecheck
+EnvironmentFile=/home/sarveshanand/proactivecheck/watchdog/.env
+Environment=GOOGLE_APPLICATION_CREDENTIALS=/home/sarveshanand/.config/gcloud/application_default_credentials.json
+ExecStart=/home/sarveshanand/proactivecheck/.venv/bin/python -m watchdog --force-tier=hybrid
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watchdog
+
+[Install]
+WantedBy=multi-user.target

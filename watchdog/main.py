@@ -688,6 +688,7 @@ class Watchdog:
                 snapshot, node_delta, pod_delta, agent_restart_delta,
                 memory_leaks, mature_data_gaps, oomkill_trend,
                 mature_pending_pods=mature_pending,
+                history=history,
             )
         else:
             result = await self.evaluator.evaluate(
