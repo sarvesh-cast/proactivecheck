@@ -25,9 +25,15 @@ logger = logging.getLogger("watchdog.state")
 class StateManager:
     """Manages rolling snapshot window and dedup state."""
 
-    def __init__(self, state_file: str, window_size: int = 12) -> None:
+    def __init__(
+        self,
+        state_file: str,
+        window_size: int = 12,
+        interval_seconds: int = 300,
+    ) -> None:
         self.state_file = Path(state_file)
         self.window_size = window_size
+        self.interval_seconds = interval_seconds
         self._state: dict[str, Any] = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -71,11 +77,75 @@ class StateManager:
     # ── Snapshot window ───────────────────────────────────────────────
 
     def push_snapshot(self, snapshot_data: dict) -> None:
-        """Add a snapshot to the rolling window, evicting the oldest if full."""
+        """Add a snapshot to the rolling window.
+
+        Before appending, evicts any snapshots older than the staleness
+        threshold (window_size × interval).  This prevents stale data from
+        persisting after a gap (e.g., watchdog down for 2 hours) and
+        poisoning trend calculations like memory-leak detection or
+        cascading-scaling deltas.
+
+        After eviction, trims the window to ``window_size`` entries.
+        """
+        self._evict_stale_snapshots(snapshot_data)
         self._state["snapshots"].append(snapshot_data)
         # Trim to window size
         if len(self._state["snapshots"]) > self.window_size:
             self._state["snapshots"] = self._state["snapshots"][-self.window_size:]
+
+    def _evict_stale_snapshots(self, incoming: dict) -> None:
+        """Remove snapshots older than the staleness window.
+
+        Staleness window = window_size × interval_seconds (default 12 × 300s = 60 min).
+        Any snapshot whose timestamp is more than this duration before the
+        incoming snapshot's timestamp is discarded.
+
+        This is a no-op when snapshots are arriving on schedule (the
+        count-based trim in push_snapshot already keeps the window bounded).
+        It only kicks in after a gap — e.g., watchdog was down for 2 hours,
+        then resumes.  Without this, the old snapshots would persist until
+        naturally pushed out by count, causing misleading trends.
+        """
+        snaps = self._state["snapshots"]
+        if not snaps:
+            return
+
+        # Parse incoming timestamp
+        incoming_ts_str = incoming.get("timestamp", "")
+        if not incoming_ts_str:
+            return
+        try:
+            incoming_ts = datetime.fromisoformat(
+                incoming_ts_str.replace("Z", "+00:00")
+            )
+        except (ValueError, TypeError):
+            return
+
+        max_age_seconds = self.window_size * self.interval_seconds
+        cutoff = incoming_ts.timestamp() - max_age_seconds
+
+        before = len(snaps)
+        kept = []
+        for s in snaps:
+            ts_str = s.get("timestamp", "")
+            if not ts_str:
+                kept.append(s)  # keep snapshots without timestamps (shouldn't happen)
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts.timestamp() >= cutoff:
+                    kept.append(s)
+            except (ValueError, TypeError):
+                kept.append(s)  # keep unparseable timestamps
+
+        evicted = before - len(kept)
+        if evicted > 0:
+            logger.info(
+                "Staleness eviction: dropped %d/%d snapshots older than %d min "
+                "(gap detected, incoming=%s)",
+                evicted, before, max_age_seconds // 60, incoming_ts_str,
+            )
+            self._state["snapshots"] = kept
 
     def get_snapshots(self) -> list[dict]:
         """Return all snapshots in the rolling window (oldest first)."""
@@ -104,24 +174,25 @@ class StateManager:
         return [s.get("node_count", 0) for s in self._state["snapshots"]]
 
     def get_workload_memory_trend(self, namespace: str, workload: str) -> list[float]:
-        """Return memory (MiB) for a specific workload across snapshots.
+        """Return actual memory usage (MiB) for a specific workload across snapshots.
 
-        Prefers usage_mib (actual usage from pod metrics, hybrid tier) over
-        request_mem_mib (WOOP resource ratios, MCP/API tiers).
-        If monotonically increasing across 3+ snapshots, it's a potential leak.
+        Only uses usage_mib (real pod metrics from hybrid tier).  Does NOT
+        fall back to request_mem_mib — WOOP adjusting requests across
+        snapshots is normal behavior, not a memory leak.
+        Returns None in the list for snapshots where usage_mib is unavailable.
         """
-        values = []
+        values: list[float | None] = []
         for snap in self._state["snapshots"]:
             found = False
             for entry in snap.get("workload_memory_usage", []):
                 if (entry.get("namespace") == namespace
                         and entry.get("workload") == workload):
-                    mib = entry.get("usage_mib") or entry.get("request_mem_mib", 0)
+                    mib = entry.get("usage_mib")  # real usage only
                     values.append(mib)
                     found = True
                     break
             if not found:
-                values.append(0)
+                values.append(None)
         return values
 
     def get_agent_restart_trend(self) -> list[dict]:
@@ -161,9 +232,13 @@ class StateManager:
         return total_delta
 
     def detect_memory_leaks(self, min_snapshots: int = 3) -> list[dict]:
-        """Detect workloads with monotonically increasing memory across snapshots.
+        """Detect workloads with monotonically increasing actual memory usage.
 
-        Returns list of {namespace, workload, trend: [mib, ...]} for leaking workloads.
+        Only considers usage_mib (real pod metrics, hybrid tier).  Workloads
+        that only have request_mem_mib are skipped — WOOP adjusting requests
+        across snapshots is normal, not a memory leak.
+
+        Returns list of {namespace, workload, trend_mib: [float, ...], growth_pct} for leaking workloads.
         """
         if len(self._state["snapshots"]) < min_snapshots:
             return []
@@ -172,10 +247,16 @@ class StateManager:
         latest = self._state["snapshots"][-1]
         leaks = []
         for entry in latest.get("workload_memory_usage", []):
+            # Skip if the latest entry doesn't have real usage data
+            if not entry.get("usage_mib"):
+                continue
             ns = entry.get("namespace", "")
             wl = entry.get("workload", "")
             trend = self.get_workload_memory_trend(ns, wl)
+            # Filter to only snapshots with real usage data (no None gaps)
             recent = trend[-min_snapshots:]
+            if any(v is None for v in recent):
+                continue
             # Check monotonically increasing with meaningful growth (>5% total)
             if len(recent) >= min_snapshots and all(
                 b > a for a, b in zip(recent, recent[1:])

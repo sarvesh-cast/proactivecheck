@@ -14,7 +14,7 @@ RUN groupadd -r watchdog && useradd -r -g watchdog -d /app -s /sbin/nologin watc
 
 WORKDIR /app
 
-# Install snapshot-cli for Tier 2 GCS fallback
+# Install snapshot-cli for Tier 2 fallback (uses --environment, no GCS SA needed)
 # Download the latest release binary from GitHub (linux/amd64)
 ARG SNAPSHOT_CLI_VERSION=latest
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \

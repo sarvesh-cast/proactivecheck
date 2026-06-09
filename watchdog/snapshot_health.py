@@ -560,10 +560,82 @@ def analyze_recommendations(
     }
 
 
+# ── Pod-to-workload owner mapping ─────────────────────────────────────
+
+def build_pod_owner_map(pods: list[dict]) -> dict[str, str]:
+    """Build a map of (namespace/pod-name) → workload-name from ownerReferences.
+
+    Walks the ownerReference chain: Pod → ReplicaSet → Deployment.
+    For DaemonSet/StatefulSet pods, the owner IS the workload directly.
+    For ReplicaSet-owned pods, we strip the RS hash suffix to get the Deployment name.
+
+    Returns: {"namespace/pod-name": "workload-name", ...}
+    """
+    owner_map: dict[str, str] = {}
+    for pod in pods:
+        md = pod.get("metadata") or {}
+        ns = md.get("namespace", "")
+        pod_name = md.get("name", "")
+        owners = md.get("ownerReferences") or []
+
+        wl_name = pod_name  # fallback
+        for ref in owners:
+            kind = ref.get("kind", "")
+            ref_name = ref.get("name", "")
+            if kind == "ReplicaSet":
+                # RS name = <deployment>-<template-hash>; strip the hash
+                # Use rsplit to remove the last segment (the template hash)
+                parts = ref_name.rsplit("-", 1)
+                wl_name = parts[0] if len(parts) == 2 else ref_name
+            elif kind in ("DaemonSet", "StatefulSet", "Job"):
+                wl_name = ref_name
+            else:
+                wl_name = ref_name
+            break  # first owner only
+
+        owner_map[f"{ns}/{pod_name}"] = wl_name
+
+    return owner_map
+
+
+def _derive_workload_name(pod_name: str) -> str:
+    """Derive workload name from pod name using K8s naming conventions.
+
+    Fallback for when ownerReferences are unavailable.  Handles:
+      - Deployment:   <name>-<rs-hash(6-10)>-<pod-hash(5)>
+      - DaemonSet:    <name>-<hash(5)>
+      - StatefulSet:  <name>-<ordinal>
+    """
+    # Deployment: strip -<rs-template-hash>-<pod-hash(5)>
+    # RS hash must contain at least one digit to avoid matching real name segments
+    # like '-exporter-' which are pure alpha.
+    m = re.match(r"^(.+)-(?=[a-z0-9]*\d)[a-z0-9]{6,10}-[a-z0-9]{5}$", pod_name)
+    if m:
+        return m.group(1)
+    # StatefulSet: strip -<ordinal>
+    m = re.match(r"^(.+)-(\d+)$", pod_name)
+    if m:
+        return m.group(1)
+    # DaemonSet/Job: strip -<hash(5)>
+    m = re.match(r"^(.+)-[a-z0-9]{5}$", pod_name)
+    if m:
+        return m.group(1)
+    return pod_name
+
+
 # ── Pod metrics analysis (memory leak detection) ────────────────────────
 
-def analyze_pod_metrics(pod_metrics: list[dict]) -> list[dict]:
+def analyze_pod_metrics(
+    pod_metrics: list[dict],
+    pod_owner_map: dict[str, str] | None = None,
+) -> list[dict]:
     """Extract per-workload memory usage from podmetricsList.
+
+    Args:
+        pod_metrics: Raw podmetricsList items from the snapshot.
+        pod_owner_map: Optional map from build_pod_owner_map() for accurate
+                       pod→workload name resolution.  Falls back to regex
+                       heuristic if not provided.
 
     Returns list of {namespace, workload, container, usage_bytes, ...} dicts
     for the evaluator's memory leak trend detection.
@@ -573,9 +645,13 @@ def analyze_pod_metrics(pod_metrics: list[dict]) -> list[dict]:
         md = pm.get("metadata") or {}
         ns = md.get("namespace", "")
         pod_name = md.get("name", "")
-        # Derive workload name from pod name (strip replicaset+pod hash)
-        parts = pod_name.rsplit("-", 2)
-        wl_name = parts[0] if len(parts) >= 3 else pod_name
+
+        # Resolve workload name: prefer owner map, fall back to heuristic
+        map_key = f"{ns}/{pod_name}"
+        if pod_owner_map and map_key in pod_owner_map:
+            wl_name = pod_owner_map[map_key]
+        else:
+            wl_name = _derive_workload_name(pod_name)
 
         for ctr in pm.get("containers") or []:
             c_name = ctr.get("name", "")

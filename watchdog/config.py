@@ -197,16 +197,16 @@ class ClusterContext:
 
 @dataclass(frozen=True)
 class SnapshotConfig:
-    """GCS snapshot-cli configuration for Tier 2 fallback.
+    """Snapshot-cli configuration for Tier 2 fallback.
 
-    When the MCP server is unavailable, the watchdog can read GCS snapshots
-    directly via the snapshot-cli binary.  Requires GCS auth (workload identity
-    or GOOGLE_APPLICATION_CREDENTIALS).
+    When the MCP server is unavailable, the watchdog can read snapshots
+    via the snapshot-cli binary using --environment (internal auth,
+    no GCS SA permissions needed on the caller).
     """
 
-    gcs_bucket: str = field(default_factory=lambda: os.getenv(
-        "GCS_SNAPSHOT_BUCKET",
-        "prod-master-console-cluster-snapshots-snapshotstore",
+    environment: str = field(default_factory=lambda: os.getenv(
+        "SNAPSHOT_ENVIRONMENT",
+        "prod-master",
     ))
     cli_path: str = field(default_factory=lambda: os.getenv("SNAPSHOT_CLI_PATH", ""))
     enabled: bool = field(default_factory=lambda: os.getenv(

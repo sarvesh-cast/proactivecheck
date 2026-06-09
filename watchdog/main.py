@@ -32,27 +32,16 @@ Usage:
     # Use a fixture file instead of live API (offline testing)
     python -m watchdog --evaluator-only --fixture snapshot_fixture.json
 
-    # ── Backtest mode (historical snapshot analysis) ─────────────
-    # Collect + evaluate at specific historical timestamps
-    python -m watchdog --backtest 2026-05-21T05:00:00Z
-
-    # Multiple timestamps (builds rolling window across them)
-    python -m watchdog --backtest 2026-05-21T05:00:00Z 2026-06-01T18:30:00Z
-
-    # Single snapshot at a specific time (collector-only)
-    python -m watchdog --collector-only --snapshot-time 2026-05-21T05:00:00Z
-
     # ── Tier testing flags (hybrid flow verification) ────────────
     # Force a specific collector tier — no cascade
     python -m watchdog --collector-only --force-tier=hybrid
     python -m watchdog --collector-only --force-tier=mcp
-    python -m watchdog --collector-only --force-tier=api
 
     # Print tier diagnostics (which tier ran, timing, field coverage)
     python -m watchdog --collector-only --tier-report
     python -m watchdog --collector-only --force-tier=hybrid --tier-report
 
-    # Compare all available tiers side-by-side
+    # Compare MCP vs hybrid tiers side-by-side
     python -m watchdog --compare-tiers
 
     # Full pipeline with tier report (useful for debugging cascade)
@@ -291,16 +280,16 @@ class Watchdog:
     def __init__(
         self,
         config: WatchdogConfig | None = None,
-        snapshot_time: str | None = None,
         force_tier: str | None = None,
     ) -> None:
         self.config = config or WatchdogConfig()
-        self.snapshot_time = snapshot_time
         self.force_tier = force_tier
-        self.collector = Collector(self.config, snapshot_time=snapshot_time, force_tier=force_tier)
+        self.collector = Collector(self.config, force_tier=force_tier)
         self.evaluator = Evaluator(self.config)
         self.state = StateManager(
-            self.config.state_file, self.config.rolling_window_size
+            self.config.state_file,
+            self.config.rolling_window_size,
+            interval_seconds=self.config.run_interval_seconds,
         )
         self.notifier = Notifier(self.config, self.state)
         self._shutdown = False
@@ -462,88 +451,6 @@ class Watchdog:
             self.config.run_interval_seconds,
         )
 
-    async def run_backtest(self, timestamps: list[str]) -> None:
-        """Run collect + evaluate at each historical timestamp.
-
-        Simulates the rolling window by collecting each timestamp in order
-        and building up state, then evaluating. Always dry-run (no Slack).
-
-        Usage:
-            python -m watchdog --backtest 2026-05-21T05:00:00Z 2026-06-01T18:30:00Z
-        """
-        logger.info("=== BACKTEST MODE: %d timestamps for cluster %s ===",
-                     len(timestamps), self.config.cluster.cluster_id)
-
-        for i, ts in enumerate(timestamps, 1):
-            logger.info("── Backtest %d/%d: snapshot_time=%s ──", i, len(timestamps), ts)
-
-            # Swap the collector's snapshot_time for this iteration
-            self.collector.snapshot_time = ts
-
-            try:
-                snapshot = await self.collector.collect()
-                logger.info(
-                    "Collected @ %s: %d pods (%d OOM, %d Pending, %d CrashLoop), "
-                    "%d nodes, %d errors",
-                    ts, snapshot.total_pods, len(snapshot.oomkilled_pods),
-                    snapshot.pending_pods, snapshot.crashloop_pods,
-                    snapshot.node_count, len(snapshot.collection_errors),
-                )
-            except Exception as e:
-                logger.error("Collection failed for %s: %s", ts, e, exc_info=True)
-                continue
-
-            # Push to rolling window (builds up state across timestamps)
-            self.state.push_snapshot(snapshot.to_dict_compact())
-
-            # Compute per-interval OOMKill deltas (same as run_once)
-            snapshot.oomkilled_pods = self.state.compute_oomkill_deltas(
-                list(snapshot.oomkilled_pods)
-            )
-
-            self.state.update_data_gaps(snapshot.data_gaps)
-            self.state.update_pending_pods(snapshot.pending_pods_detail)
-
-            # Evaluate
-            try:
-                history = self.state.get_snapshots()
-                node_delta = self.state.compute_node_count_delta_pct()
-                pod_delta = self.state.compute_pod_count_delta_pct()
-                agent_restart_delta = self.state.compute_agent_restarts_last_hour()
-                memory_leaks = self.state.detect_memory_leaks()
-                mature_data_gaps = self.state.get_mature_data_gaps(min_hours=self.config.thresholds.data_gap_hours) if len(history) >= 3 else []
-                mature_pending = self.state.get_mature_pending_pods(min_minutes=float(self.config.thresholds.pending_pod_minutes))
-                oomkill_trend = self.state.get_oomkill_trend()
-
-                result = await self.evaluator.evaluate(
-                    snapshot, history, node_delta,
-                    pod_count_delta_pct=pod_delta,
-                    agent_restarts_last_hour=agent_restart_delta,
-                    memory_leaks=memory_leaks,
-                    mature_data_gaps=mature_data_gaps,
-                    mature_pending_pods=mature_pending,
-                    oomkill_trend=oomkill_trend,
-                )
-
-                # Print results
-                print(f"\n{'='*70}")
-                print(f"  BACKTEST RESULT @ {ts}")
-                print(f"{'='*70}")
-                print(f"  Verdict: {result.verdict.value}")
-                print(f"  Findings: {len(result.findings)}")
-                for f in result.findings:
-                    print(f"    [{f.severity.value:8s}] {f.category.value:25s} {f.workload}")
-                    print(f"             {f.what}")
-                    print(f"             Evidence: {f.evidence[:200]}")
-                print(f"{'='*70}\n")
-
-            except Exception as e:
-                logger.error("Evaluation failed for %s: %s", ts, e, exc_info=True)
-
-        # Save state at the end (useful for inspection)
-        self.state.save()
-        logger.info("=== BACKTEST COMPLETE: %d timestamps processed ===", len(timestamps))
-
     async def run_loop(self) -> None:
         """Run the watchdog continuously on a 5-minute schedule.
 
@@ -655,18 +562,17 @@ class Watchdog:
             tiers_to_test.append("mcp")
         if self.collector.snap:
             tiers_to_test.append("hybrid")
-        tiers_to_test.append("api")  # always available
 
         if len(tiers_to_test) < 2:
             print("Only 1 tier available — nothing to compare. "
-                  "Need at least MCP or hybrid + API.", file=sys.stderr)
+                  "Need both MCP and hybrid configured.", file=sys.stderr)
             return
 
         results: dict[str, dict] = {}
         for tier in tiers_to_test:
             logger.info("── compare-tiers: running tier '%s' ──", tier)
             collector = Collector(
-                self.config, snapshot_time=self.snapshot_time, force_tier=tier,
+                self.config, force_tier=tier,
             )
             try:
                 snapshot = await collector.collect()
@@ -928,20 +834,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="With --evaluator-only: skip LLM, use threshold checks")
     p.add_argument("--fixture", type=str, default=None,
                     help="With --evaluator-only: load snapshot from JSON file")
-    p.add_argument("--snapshot-time", type=str, default=None,
-                    help="ISO 8601 timestamp for historical snapshot (backtest mode). "
-                         "e.g. 2026-05-21T05:00:00Z")
-    p.add_argument("--backtest", type=str, nargs="+", default=None,
-                    metavar="TIMESTAMP",
-                    help="Run collect+evaluate at one or more historical timestamps. "
-                         "e.g. --backtest 2026-05-21T05:00:00Z 2026-06-01T18:30:00Z")
 
     # ── Tier testing flags ──
     p.add_argument("--force-tier", type=str, default=None,
-                    choices=["mcp", "hybrid", "api"],
+                    choices=["mcp", "hybrid"],
                     help="Force collector to use only this tier (no cascade). "
-                         "mcp = MCP server only, hybrid = snapshot-cli + API, "
-                         "api = public API only. Errors if prerequisites not met.")
+                         "mcp = MCP server only, hybrid = snapshot-cli + API. "
+                         "Errors if prerequisites not met.")
     p.add_argument("--tier-report", action="store_true",
                     help="After collection, print a diagnostic report showing which "
                          "tier ran, timing, field coverage, and errors. "
@@ -977,13 +876,10 @@ async def _run_multi_cluster(base_config: WatchdogConfig, args) -> None:
         if is_multi:
             logger.info("── Cluster %d/%d: %s (%s) ──", i + 1, len(clusters), cname or cid[:8], cid)
 
-        snapshot_time = getattr(args, "snapshot_time", None)
         force_tier = getattr(args, "force_tier", None)
-        watchdog = Watchdog(cfg, snapshot_time=snapshot_time, force_tier=force_tier)
+        watchdog = Watchdog(cfg, force_tier=force_tier)
 
-        if getattr(args, "backtest", None):
-            await watchdog.run_backtest(args.backtest)
-        elif args.state_dump:
+        if args.state_dump:
             watchdog.dump_state()
         elif getattr(args, "compare_tiers", False):
             await watchdog.run_compare_tiers()

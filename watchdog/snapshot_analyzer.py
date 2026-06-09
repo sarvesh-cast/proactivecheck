@@ -1,15 +1,14 @@
-"""Async wrapper around the snapshot-cli binary for direct GCS snapshot access.
+"""Async wrapper around the snapshot-cli binary for snapshot access.
 
 Vendored and adapted from sales-engineering-snapshot-analyzer/backend/snapshot_client.py.
 Used as Tier 2 fallback when the CAST AI MCP server is unavailable.
 
 Requirements:
   - snapshot-cli binary in PATH (or SNAPSHOT_CLI_PATH env var)
-  - GCS auth: workload identity (EKS) or GOOGLE_APPLICATION_CREDENTIALS
 
-The snapshot-cli reads .btrsp files from GCS and returns JSON.  Each call is
-a subprocess invocation wrapped in asyncio.to_thread so the event loop stays
-non-blocking.
+Uses --environment flag (e.g. prod-master) which handles auth internally —
+no GCS SA permissions needed on the caller.  Each call is a subprocess
+invocation wrapped in asyncio.to_thread so the event loop stays non-blocking.
 """
 
 from __future__ import annotations
@@ -45,13 +44,14 @@ class ResourceNotFoundError(SnapshotCLIError):
 # ── Client ──────────────────────────────────────────────────────────────
 
 class SnapshotAnalyzer:
-    """Async client for reading CAST AI cluster snapshots from GCS.
+    """Async client for reading CAST AI cluster snapshots.
 
-    Uses the snapshot-cli binary directly — no MCP server dependency.
+    Uses the snapshot-cli binary with --environment for internal auth —
+    no MCP server dependency, no GCS SA permissions required.
 
     Args:
         cluster_id: Cluster UUID
-        gcs_bucket: GCS bucket name (e.g. 'prod-master-console-cluster-snapshots-snapshotstore')
+        environment: snapshot-cli environment (e.g. 'prod-master')
         cli_path: Optional path to snapshot-cli binary (searches PATH if not given)
         snapshot_name: Optional specific snapshot (uses latest if omitted)
     """
@@ -59,12 +59,12 @@ class SnapshotAnalyzer:
     def __init__(
         self,
         cluster_id: str,
-        gcs_bucket: str,
+        environment: str = "prod-master",
         cli_path: str | None = None,
         snapshot_name: str | None = None,
     ) -> None:
         self.cluster_id = cluster_id
-        self.gcs_bucket = gcs_bucket
+        self.environment = environment
         self.snapshot_name = snapshot_name
         self._cli_path = cli_path or self._find_cli()
 
@@ -83,7 +83,7 @@ class SnapshotAnalyzer:
         cmd = [
             self._cli_path, *args,
             f"--cluster-id={self.cluster_id}",
-            f"--gcs-bucket={self.gcs_bucket}",
+            f"--environment={self.environment}",
         ]
         if self.snapshot_name:
             cmd.append(f"--snapshot-name={self.snapshot_name}")
@@ -181,7 +181,7 @@ class SnapshotAnalyzer:
         }
 
     async def health_check(self) -> bool:
-        """Verify snapshot-cli can reach GCS and read a snapshot."""
+        """Verify snapshot-cli can reach snapshots and read data."""
         try:
             # List sections is a lightweight probe
             await asyncio.to_thread(
