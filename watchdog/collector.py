@@ -1420,8 +1420,22 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
             )
 
         # ── Memory metrics from podmetricsList ──
+        # Build a set of live pod names from the podList to filter out stale
+        # metrics entries (Kubernetes metrics API can lag pod termination).
+        live_pod_names: set[str] = set()
+        for p in snap_data["pods"]:
+            md = p.get("metadata") or {}
+            ns = md.get("namespace", "")
+            name = md.get("name", "")
+            if ns and name:
+                live_pod_names.add(f"{ns}/{name}")
+
         pod_owner_map = build_pod_owner_map(snap_data["pods"])
-        mem_usage = analyze_pod_metrics(snap_data["pod_metrics"], pod_owner_map=pod_owner_map)
+        mem_usage = analyze_pod_metrics(
+            snap_data["pod_metrics"],
+            pod_owner_map=pod_owner_map,
+            live_pod_names=live_pod_names,
+        )
         snapshot.workload_memory_usage = [
             {
                 "namespace": m["namespace"],
@@ -1429,6 +1443,7 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
                 "container": m["container"],
                 "usage_bytes": m["usage_bytes"],
                 "usage_mib": round(m["usage_bytes"] / (1024 * 1024), 1),
+                "pod_count": m.get("pod_count", 1),
             }
             for m in mem_usage
         ]

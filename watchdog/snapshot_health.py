@@ -628,6 +628,7 @@ def _derive_workload_name(pod_name: str) -> str:
 def analyze_pod_metrics(
     pod_metrics: list[dict],
     pod_owner_map: dict[str, str] | None = None,
+    live_pod_names: set[str] | None = None,
 ) -> list[dict]:
     """Extract per-workload memory usage from podmetricsList.
 
@@ -636,15 +637,29 @@ def analyze_pod_metrics(
         pod_owner_map: Optional map from build_pod_owner_map() for accurate
                        pod→workload name resolution.  Falls back to regex
                        heuristic if not provided.
+        live_pod_names: Optional set of "namespace/pod-name" strings from the
+                        actual podList.  When provided, any metrics entry whose
+                        pod is NOT in this set is skipped — the Kubernetes
+                        metrics API can lag behind pod termination and return
+                        stale entries for already-deleted pods, which inflates
+                        aggregate workload memory and causes false leak alerts.
 
     Returns list of {namespace, workload, container, usage_bytes, ...} dicts
     for the evaluator's memory leak trend detection.
     """
     usage: list[dict] = []
+    skipped_stale = 0
     for pm in pod_metrics:
         md = pm.get("metadata") or {}
         ns = md.get("namespace", "")
         pod_name = md.get("name", "")
+
+        # Skip stale metrics for pods that no longer exist in the podList
+        if live_pod_names is not None:
+            pod_key = f"{ns}/{pod_name}"
+            if pod_key not in live_pod_names:
+                skipped_stale += 1
+                continue
 
         # Resolve workload name: prefer owner map, fall back to heuristic
         map_key = f"{ns}/{pod_name}"
@@ -681,6 +696,13 @@ def analyze_pod_metrics(
         agg[key]["usage_bytes"] += u["usage_bytes"]
         agg[key]["usage_cpu_m"] += u["usage_cpu_m"]
         agg[key]["pod_count"] += 1
+
+    if skipped_stale > 0:
+        logger.info(
+            "analyze_pod_metrics: skipped %d stale metrics entries "
+            "(pods no longer in podList), kept %d",
+            skipped_stale, len(usage),
+        )
 
     sorted_usage = sorted(agg.values(), key=lambda x: x["usage_bytes"], reverse=True)
     return sorted_usage[:50]
