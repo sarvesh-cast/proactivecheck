@@ -592,7 +592,8 @@ class Evaluator:
             _escalate(Severity.CRITICAL)
             for oom_pod in critical_oom:
                 ns = oom_pod.get("namespace", "")
-                name = oom_pod.get("name", "unknown")
+                # Prefer resolved workload_name (Deployment/StatefulSet) over pod name
+                name = oom_pod.get("workload_name", oom_pod.get("name", "unknown"))
                 wl = f"{ns}/{name}" if ns else name
                 oom_rate = oom_pod.get("_oom_rate_1h", 0)
                 container = oom_pod.get("container", "")
@@ -847,7 +848,7 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
                     category=FindingCategory.CRASHLOOP,
-                    workload=f"{cl['namespace']}/{cl['name']}",
+                    workload=f"{cl['namespace']}/{cl.get('workload_name', cl['name'])}",
                     what=f"Container `{cl.get('container', '?')}` in CrashLoopBackOff (restarts: {cl.get('restart_count', 0)})",
                     evidence=json.dumps(cl),
                     suggested_action="Check pod logs and events — all replicas may be down",

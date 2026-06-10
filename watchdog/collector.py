@@ -316,6 +316,21 @@ class Collector:
 
         # ── Post-collection enrichment ─────────────────────────────────
         # All parallel calls are done; enrich entries with cross-source data.
+
+        # Merge snapshot-derived owner_kind_map into workload_kind_map.
+        # WOOP-sourced kinds (from _mcp_woop_workloads) take precedence;
+        # owner_kind_map fills in the gaps for non-WOOP workloads.
+        owner_kind = getattr(snapshot, "_owner_kind_map", {})
+        if owner_kind:
+            for wl_key, kind in owner_kind.items():
+                if wl_key not in snapshot.workload_kind_map:
+                    snapshot.workload_kind_map[wl_key] = kind
+            logger.info(
+                "Merged owner_kind_map: %d entries, kind_map now %d",
+                len(owner_kind), len(snapshot.workload_kind_map),
+            )
+            del snapshot._owner_kind_map  # clean up temp attribute
+
         self._enrich_oom_entries(snapshot)
         self._enrich_data_gaps(snapshot)
 
@@ -357,9 +372,11 @@ class Collector:
         for o in snapshot.oomkilled_pods:
             ns = o.get("namespace", "")
             pod_name = o.get("name", "")
-            # Derive workload name from pod name for matching
-            parts = pod_name.rsplit("-", 2)
-            wl_name = parts[0] if len(parts) >= 3 else pod_name
+            # Use resolved workload_name if available; fall back to heuristic
+            wl_name = o.get("workload_name", "")
+            if not wl_name:
+                parts = pod_name.rsplit("-", 2)
+                wl_name = parts[0] if len(parts) >= 3 else pod_name
             wl_key = f"{ns}/{wl_name}"
 
             # Also try exact name (for WOOP-sourced entries where name IS the workload)
@@ -435,6 +452,7 @@ crashloop_details = []
 agent_pods = []
 agent_total_restarts = 0
 pending_details = []
+owner_kind_map = {}
 
 for pod in pods:
     md = pod.get("metadata", {})
@@ -442,6 +460,32 @@ for pod in pods:
     ns = md.get("namespace", "")
     name = md.get("name", "")
     phase = st.get("phase", "Unknown")
+
+    # Resolve workload name + kind from ownerReferences
+    owners = md.get("ownerReferences", [])
+    wl_name = name  # fallback to pod name
+    wl_kind = ""
+    if owners:
+        ref = owners[0]
+        ref_kind = ref.get("kind", "")
+        ref_name = ref.get("name", "")
+        if ref_kind == "ReplicaSet":
+            # RS name = <deployment>-<template-hash>; strip the hash
+            parts = ref_name.rsplit("-", 1)
+            if len(parts) == 2:
+                wl_name = parts[0]
+            else:
+                wl_name = ref_name
+            wl_kind = "Deployment"
+        elif ref_kind in ("DaemonSet", "StatefulSet", "Job"):
+            wl_name = ref_name
+            wl_kind = ref_kind
+        else:
+            wl_name = ref_name
+            wl_kind = ref_kind
+    wl_key = ns + "/" + wl_name
+    if wl_kind and wl_key not in owner_kind_map:
+        owner_kind_map[wl_key] = wl_kind
 
     if phase == "Running":
         running = running + 1
@@ -513,6 +557,7 @@ for pod in pods:
             oomkilled.append({
                 "namespace": ns,
                 "name": name,
+                "workload_name": wl_name,
                 "container": c_name,
                 "restart_count": rc,
                 "last_oomkill_time": oom_time,
@@ -526,6 +571,7 @@ for pod in pods:
             crashloop_details.append({
                 "namespace": ns,
                 "name": name,
+                "workload_name": wl_name,
                 "container": cs.get("name", ""),
                 "restart_count": rc,
             })
@@ -613,6 +659,7 @@ result = {
     "agent_pods": agent_pods,
     "agent_total_restarts": agent_total_restarts,
     "unhealthy_deployments": unhealthy_deployments[:20],
+    "owner_kind_map": owner_kind_map,
 }
 '''
         data = self._unwrap_snapshot_result(
@@ -652,6 +699,12 @@ result = {
             )
         snapshot.oomkilled_pods = recent_oom
         snapshot.agent_restarts_last_hour = data.get("agent_total_restarts", 0)
+
+        # Stash owner_kind_map for post-collection merge into workload_kind_map.
+        # This map is derived from pod ownerReferences and covers ALL workloads
+        # (including those not in WOOP).  Merged after _mcp_woop_workloads so
+        # WOOP-sourced kinds take precedence.
+        snapshot._owner_kind_map = data.get("owner_kind_map", {})
 
         # Rich node data
         snapshot.nodes = data.get("node_summary", [])
@@ -908,11 +961,12 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
         snapshot_workload_keys = set()
         for o in snapshot.oomkilled_pods:
             ns = o.get("namespace", "")
-            pod_name = o.get("name", "")
-            # Derive workload name from pod name (strip replicaset/pod hash suffix)
-            # e.g. alerts-service-5cf45448d9-xggdt → alerts-service
-            parts = pod_name.rsplit("-", 2)
-            wl_name = parts[0] if len(parts) >= 3 else pod_name
+            # Use resolved workload_name if available; fall back to heuristic
+            wl_name = o.get("workload_name", "")
+            if not wl_name:
+                pod_name = o.get("name", "")
+                parts = pod_name.rsplit("-", 2)
+                wl_name = parts[0] if len(parts) >= 3 else pod_name
             snapshot_workload_keys.add(f"{ns}/{wl_name}")
 
         kept_woop = [
@@ -1243,6 +1297,28 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
             name = md.get("name", "")
             phase = st.get("phase", "Unknown")
 
+            # Resolve workload name from ownerReferences
+            owners = md.get("ownerReferences") or []
+            wl_name = name
+            wl_kind = ""
+            if owners:
+                ref = owners[0]
+                ref_kind = ref.get("kind", "")
+                ref_name = ref.get("name", "")
+                if ref_kind == "ReplicaSet":
+                    parts = ref_name.rsplit("-", 1)
+                    wl_name = parts[0] if len(parts) == 2 else ref_name
+                    wl_kind = "Deployment"
+                elif ref_kind in ("DaemonSet", "StatefulSet", "Job"):
+                    wl_name = ref_name
+                    wl_kind = ref_kind
+                else:
+                    wl_name = ref_name
+                    wl_kind = ref_kind
+            wl_key = f"{ns}/{wl_name}"
+            if wl_kind and wl_key not in snapshot.workload_kind_map:
+                snapshot.workload_kind_map[wl_key] = wl_kind
+
             if phase == "Running":
                 running += 1
             elif phase == "Pending":
@@ -1266,6 +1342,7 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
                     if term.get("reason") == "OOMKilled":
                         oomkilled.append({
                             "namespace": ns, "name": name,
+                            "workload_name": wl_name,
                             "container": cs.get("name", ""),
                             "restart_count": cs.get("restartCount", 0),
                         })
@@ -1274,6 +1351,7 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
                         crashloop += 1
                         crashloop_details.append({
                             "namespace": ns, "name": name,
+                            "workload_name": wl_name,
                             "container": cs.get("name", ""),
                             "restart_count": cs.get("restartCount", 0),
                         })

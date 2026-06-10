@@ -115,6 +115,21 @@ def analyze_pod_health(
         name = md.get("name", "")
         phase = st.get("phase", "Unknown")
 
+        # Resolve workload name from ownerReferences
+        owners = md.get("ownerReferences") or []
+        wl_name = name  # fallback to pod name
+        if owners:
+            ref = owners[0]
+            ref_kind = ref.get("kind", "")
+            ref_name = ref.get("name", "")
+            if ref_kind == "ReplicaSet":
+                parts = ref_name.rsplit("-", 1)
+                wl_name = parts[0] if len(parts) == 2 else ref_name
+            elif ref_kind in ("DaemonSet", "StatefulSet", "Job"):
+                wl_name = ref_name
+            else:
+                wl_name = ref_name
+
         if phase == "Running":
             running += 1
         elif phase == "Pending":
@@ -181,6 +196,7 @@ def analyze_pod_health(
                     oomkilled.append({
                         "namespace": ns,
                         "name": name,
+                        "workload_name": wl_name,
                         "container": c_name,
                         "restart_count": rc,
                         "last_oomkill_time": oom_time,
@@ -193,6 +209,7 @@ def analyze_pod_health(
                     oomkilled.append({
                         "namespace": ns,
                         "name": name,
+                        "workload_name": wl_name,
                         "container": c_name,
                         "restart_count": rc,
                         "last_oomkill_time": "unknown",
@@ -207,6 +224,7 @@ def analyze_pod_health(
                 crashloop_details.append({
                     "namespace": ns,
                     "name": name,
+                    "workload_name": wl_name,
                     "container": cs.get("name", ""),
                     "restart_count": rc,
                 })
