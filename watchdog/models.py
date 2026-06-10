@@ -84,6 +84,12 @@ class SnapshotData:
     workload_memory_usage: list[dict] = field(default_factory=list)
     # [{namespace, workload, container, usage_bytes, request_bytes, limit_bytes}]
 
+    # Workload metadata maps — used by evaluator to enrich findings
+    # {namespace/workload → "MANAGED" | "READ_ONLY" | "UNDEFINED" | "UNMANAGED"}
+    woop_management_map: dict[str, str] = field(default_factory=dict)
+    # {namespace/workload → "Deployment" | "StatefulSet" | "DaemonSet" | ...}
+    workload_kind_map: dict[str, str] = field(default_factory=dict)
+
     # Loki log signals
     log_signals: list[dict] = field(default_factory=list)
 
@@ -104,6 +110,9 @@ class SnapshotData:
         d.pop("woop_workloads", None)
         # Keep node_count but drop per-node detail (nodes list)
         d.pop("nodes", None)
+        # Drop lookup maps — transient, not needed in state history
+        d.pop("woop_management_map", None)
+        d.pop("workload_kind_map", None)
         # Trim collection_errors to just the count
         errors = d.get("collection_errors", [])
         d["collection_errors"] = [f"({len(errors)} errors)"] if errors else []

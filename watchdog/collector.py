@@ -718,6 +718,7 @@ ab = []
 dg = []
 dgs = set()
 rl = {{}}
+wm = {{}}
 su = {{"managed": 0, "read_only": 0, "undefined": 0, "total": len(wls)}}
 
 for wl in wls:
@@ -728,6 +729,8 @@ for wl in wls:
     mg = vc.get("managementOption", "UNDEFINED")
     at = vc.get("applyType", "")
     wt = mg + ("/" + at if at else "")
+    kd_raw = wl.get("kind", "")
+    wm[wk] = {{"mgmt": mg, "kind": kd_raw}}
     su["managed" if mg == "MANAGED" else "read_only" if mg == "READ_ONLY" else "undefined"] += 1
     skip = False
     for p in S2Z:
@@ -736,7 +739,7 @@ for wl in wls:
             break
     if skip:
         continue
-    kd = wl.get("kind", "")
+    kd = kd_raw
     if kd in ("Job", "CronJob"):
         continue
     ctrs = wl.get("containers") or []
@@ -784,7 +787,7 @@ for wl in wls:
             if p > MP and abs(rm - am) >= MMG:
                 mm.append(mk(wk, cn, wt, {{"apply_type": at, "recommended_memory_gib": round(rm, 1), "actual_memory_gib": round(am, 1), "rec_display": fm(rm), "applied_display": fm(am), "diff_pct": round(p, 1)}}))
 
-result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_lookup": rl}}
+result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_lookup": rl, "woop_meta": wm}}
 '''
 
         woop_args = {
@@ -842,12 +845,22 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
                 "lookup": rec_lookup,
             })
 
+        # Build woop_management_map and workload_kind_map from woop_meta
+        woop_meta = data.get("woop_meta", {})
+        for wl_key, meta in woop_meta.items():
+            snapshot.woop_management_map[wl_key] = meta.get("mgmt", "UNDEFINED")
+            kind = meta.get("kind", "")
+            if kind:
+                snapshot.workload_kind_map[wl_key] = kind
+
         logger.info(
             "WOOP (analyze_with_code): %d workloads (managed=%d, read_only=%d, "
-            "undefined=%d), %d mismatches, %d absurd, %d data gaps",
+            "undefined=%d), %d mismatches, %d absurd, %d data gaps, "
+            "mgmt_map=%d, kind_map=%d",
             woop_summary.get("total", 0), woop_summary.get("managed", 0),
             woop_summary.get("read_only", 0), woop_summary.get("undefined", 0),
             len(mismatches), len(absurd), len(data_gaps),
+            len(snapshot.woop_management_map), len(snapshot.workload_kind_map),
         )
 
     async def _mcp_oom_summary(self, snapshot: SnapshotData) -> None:
@@ -1419,6 +1432,41 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
                 "WOOP managementOption unavailable — mismatch/absurd detection skipped"
             )
 
+        # ── Build woop_management_map + workload_kind_map ──
+        # woop_mgmt_map has {ns/wl → {mgmt, kind, ...}} from the API
+        for wl_key, meta in woop_mgmt_map.items():
+            snapshot.woop_management_map[wl_key] = meta.get("mgmt", "UNDEFINED")
+            kind = meta.get("kind", "")
+            if kind:
+                snapshot.workload_kind_map[wl_key] = kind
+
+        # Supplement kind_map from pod ownerReferences (catches workloads not in WOOP)
+        # Also reused below for memory metrics
+        pod_owner_map = build_pod_owner_map(snap_data["pods"])
+        for pod in snap_data["pods"]:
+            md = pod.get("metadata") or {}
+            ns = md.get("namespace", "")
+            pod_name = md.get("name", "")
+            pod_key = f"{ns}/{pod_name}"
+            wl_name = pod_owner_map.get(pod_key, "")
+            if not wl_name:
+                continue
+            wl_key = f"{ns}/{wl_name}"
+            if wl_key not in snapshot.workload_kind_map:
+                owners = md.get("ownerReferences") or []
+                for ref in owners:
+                    kind = ref.get("kind", "")
+                    if kind == "ReplicaSet":
+                        kind = "Deployment"  # RS owner is always a Deployment
+                    if kind:
+                        snapshot.workload_kind_map[wl_key] = kind
+                        break
+
+        logger.info(
+            "Workload metadata maps: woop_mgmt=%d, kind=%d",
+            len(snapshot.woop_management_map), len(snapshot.workload_kind_map),
+        )
+
         # ── Memory metrics from podmetricsList ──
         # Build a set of live pod names from the podList to filter out stale
         # metrics entries (Kubernetes metrics API can lag pod termination).
@@ -1430,7 +1478,7 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
             if ns and name:
                 live_pod_names.add(f"{ns}/{name}")
 
-        pod_owner_map = build_pod_owner_map(snap_data["pods"])
+        # pod_owner_map already built above for kind_map
         mem_usage = analyze_pod_metrics(
             snap_data["pod_metrics"],
             pod_owner_map=pod_owner_map,

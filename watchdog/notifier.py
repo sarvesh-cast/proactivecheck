@@ -914,6 +914,19 @@ class Notifier:
             return {}
 
     @staticmethod
+    def _workload_tag(ev: dict) -> str:
+        """Build a compact tag like 'StatefulSet · UNMANAGED' from evidence metadata."""
+        parts = []
+        kind = ev.get("workload_kind", "")
+        if kind:
+            parts.append(kind)
+        status = ev.get("woop_status", "")
+        if status and status != "MANAGED":
+            # Only show non-MANAGED status — MANAGED is the default/expected
+            parts.append(status)
+        return " · ".join(parts)
+
+    @staticmethod
     def _fmt_bytes(val, field_name: str = "") -> str:
         """Format a byte or MiB value to human-readable string."""
         if not val and val != 0:
@@ -975,8 +988,10 @@ class Notifier:
                 context_parts.append(f"rec {rec_str}")
             context = " → ".join(context_parts) if context_parts else "-"
 
+            tag = self._workload_tag(ev)
+            wl_display = f"{f.workload} ({tag})" if tag else f.workload
             rows.append([
-                f.workload,
+                wl_display,
                 ev.get("container", "-"),
                 restarts,
                 context,
@@ -1012,7 +1027,9 @@ class Notifier:
             else:
                 container = "-"
                 restarts = "?"
-            rows.append([f.workload, container, restarts])
+            tag = self._workload_tag(ev if isinstance(ev, dict) else {})
+            wl_display = f"{f.workload} ({tag})" if tag else f.workload
+            rows.append([wl_display, container, restarts])
 
         table = self._make_table(["Workload", "Container", "Restarts"], rows)
         extra = f"\n_+{len(findings) - 15} more_" if len(findings) > 15 else ""
@@ -1159,8 +1176,10 @@ class Notifier:
             growth = ev.get("growth_pct", "?")
             current_mib = f"{trend[-1]:.0f} MiB" if trend else "?"
             trend_str = " → ".join(f"{v:.0f}" for v in trend[-4:]) if trend else "?"
+            tag = self._workload_tag(ev)
+            wl_display = f"{wl} ({tag})" if tag else wl
             rows.append([
-                wl,
+                wl_display,
                 current_mib,
                 f"+{growth}%" if isinstance(growth, (int, float)) else str(growth),
                 trend_str,

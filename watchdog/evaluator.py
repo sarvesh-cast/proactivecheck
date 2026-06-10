@@ -459,6 +459,46 @@ class Evaluator:
             raw_response=raw[:2000],  # truncate for storage
         )
 
+    @staticmethod
+    def _enrich_findings_with_metadata(
+        findings: list[Finding],
+        snapshot: SnapshotData,
+    ) -> None:
+        """Inject workload_kind and woop_status into each finding's evidence.
+
+        Reads from snapshot.woop_management_map and snapshot.workload_kind_map.
+        Workloads not in woop_management_map are tagged as "UNMANAGED".
+        """
+        mgmt_map = snapshot.woop_management_map
+        kind_map = snapshot.workload_kind_map
+
+        for f in findings:
+            wl = f.workload
+            if not wl or wl in ("cluster-level", "org-level"):
+                continue
+
+            # Look up metadata
+            woop_status = mgmt_map.get(wl)
+            if woop_status is None:
+                woop_status = "UNMANAGED"
+            wl_kind = kind_map.get(wl, "")
+
+            # Inject into evidence JSON
+            try:
+                ev = json.loads(f.evidence) if isinstance(f.evidence, str) else f.evidence
+                if isinstance(ev, dict):
+                    ev["woop_status"] = woop_status
+                    if wl_kind:
+                        ev["workload_kind"] = wl_kind
+                    f.evidence = json.dumps(ev)
+                elif isinstance(ev, list) and ev and isinstance(ev[0], dict):
+                    ev[0]["woop_status"] = woop_status
+                    if wl_kind:
+                        ev[0]["workload_kind"] = wl_kind
+                    f.evidence = json.dumps(ev)
+            except (json.JSONDecodeError, TypeError):
+                pass  # evidence is plain text — skip enrichment
+
     def _raw_metrics_fallback(
         self,
         snapshot: SnapshotData,
@@ -982,6 +1022,9 @@ class Evaluator:
             node_count=snapshot.node_count,
             node_count_delta_pct=node_count_delta_pct,
         )
+
+        # Enrich all findings with workload_kind + woop_status
+        self._enrich_findings_with_metadata(findings, snapshot)
 
         return EvaluationResult(
             verdict=verdict,
