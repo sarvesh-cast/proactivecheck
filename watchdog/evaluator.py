@@ -530,8 +530,16 @@ class Evaluator:
         # ── 1. OOMKill spiral ────────────────────────────────────────
         # Rate calculation priority:
         #   1. oom_events_1h (WOOP events API — authoritative, already time-windowed)
-        #   2. delta / snapshot_interval_hours (cross-snapshot comparison from state.py)
-        #   3. restart_count / pod_age_hours (cold-start fallback, first snapshot only)
+        #   2. oom_window_count / oom_window_hours (window-based OOM appearances
+        #      from state.py — counts how many snapshots had this workload as
+        #      OOMKilled, a reliable lower bound on actual OOM events)
+        #   3. cold-start fallback: oom_window_count=1 / pod_age (first snapshot,
+        #      only for young pods < 1h)
+        #
+        # NOTE: restart_count (container restartCount) includes ALL restart
+        # reasons — OOM, liveness probe kills, Error exits, etc.  It must NOT
+        # be used as an OOM-specific count.  The oom_window_count field counts
+        # actual OOM detections across the rolling snapshot window.
         #
         # Recency gate: regardless of computed rate, skip the pod if
         # last_oomkill_time is >1h ago — the problem has stopped.
@@ -557,30 +565,33 @@ class Evaluator:
                 # Priority 1: WOOP events API (authoritative)
                 oom_rate = oom_events
             else:
-                delta = o.get("restart_count", 0)
-                interval = o.get("snapshot_interval_hours")
-                if interval is not None and interval > 0:
-                    # Priority 2: cross-snapshot delta / interval
-                    oom_rate = delta / interval
+                window_count = o.get("oom_window_count", 1)
+                window_hours = o.get("oom_window_hours", 0.0)
+
+                if window_hours > 0 and window_count > 0:
+                    # Priority 2: window-based OOM rate.
+                    # window_count = number of snapshots that detected this
+                    # workload as OOMKilled.  Each is a confirmed OOM event.
+                    oom_rate = window_count / window_hours
                 else:
-                    # Priority 3: cold-start fallback (first snapshot, no previous).
-                    # Lifetime average is only reliable for young pods (< 1h).
-                    # For older pods, skip — accurate delta will be available
-                    # on the next run (5 min later).
+                    # Priority 3: cold-start fallback (first snapshot, no window).
+                    # We know at least 1 OOM happened (that's why it's in the list).
+                    # Don't use restart_count — it includes non-OOM restarts.
                     pod_age_hours = self._pod_age_hours(o.get("pod_created_at"))
                     if pod_age_hours is not None and pod_age_hours <= 1.0:
-                        oom_rate = delta / max(pod_age_hours, 0.1)
+                        oom_rate = 1.0 / max(pod_age_hours, 0.1)
                     else:
-                        # Old pod on cold start — can't trust lifetime average
+                        # Old pod on cold start — can't trust extrapolation
                         o["_oom_rate_1h"] = 0.0
                         o["_oom_skipped"] = "cold_start_old_pod"
                         continue
 
-            # Minimum count gate: a single OOM restart is not a "spiral".
-            # Require at least 2 actual restarts before alerting, regardless
-            # of extrapolated rate.
-            raw_count = o.get("restart_count", 0)
-            if raw_count < 2:
+            # Minimum count gate: a single OOM in a wide window is not a "spiral".
+            # Require at least 2 OOM appearances (or WOOP events) before alerting.
+            # Uses oom_window_count (OOM-specific) rather than restart_count
+            # (which includes non-OOM restarts and would overcount).
+            oom_count = o.get("oom_events_1h") or o.get("oom_window_count", 1)
+            if oom_count < 2:
                 o["_oom_rate_1h"] = round(oom_rate, 1)
                 o["_oom_skipped"] = "single_event"
                 continue

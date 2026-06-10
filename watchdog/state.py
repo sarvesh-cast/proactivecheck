@@ -365,74 +365,140 @@ class StateManager:
     # ── OOMKill delta computation ───────────────────────────────────
 
     def compute_oomkill_deltas(self, current_oom: list[dict]) -> list[dict]:
-        """Compute per-pod OOMKill restart deltas using cross-snapshot comparison.
+        """Enrich OOM entries with window-based OOM counts and restart deltas.
 
-        For snapshot-sourced entries, `restart_count` is the pod's lifetime
-        restartCount — not per-hour. This method compares against the previous
-        snapshot to compute actual restarts since last check.
+        Kubernetes `restartCount` includes ALL restart reasons (OOM, liveness
+        probe kills, Error exits, etc.).  Using it as an OOM-specific count
+        inflates the rate for pods with mixed failure modes.
 
-        For WOOP/API-sourced entries (source != "snapshot_lastState"),
-        `restart_count` is already time-windowed, so we pass it through unchanged.
+        This method adds two complementary metrics:
 
-        Returns the same list with:
-        - `restart_count` replaced by the delta for snapshot-sourced entries
-        - `lifetime_restart_count` storing the original value
-        - `snapshot_interval_hours` storing the time between current and previous snapshot
+        1. **oom_window_count / oom_window_hours** — how many snapshots in the
+           rolling window had this pod/workload as OOMKilled.  This is a
+           reliable lower bound on actual OOM events (can undercount if an
+           OOM is overwritten by a subsequent non-OOM restart before the next
+           snapshot, but never overcounts).
+
+        2. **restart_count delta / snapshot_interval_hours** — cross-snapshot
+           restart delta (kept for backward compatibility but no longer used
+           as the primary rate signal).
+
+        For WOOP/API-sourced entries, `restart_count` is already time-windowed,
+        so we pass it through unchanged.
+
+        Returns the same list with added fields:
+        - `oom_window_count`: OOM appearances across the rolling window
+        - `oom_window_hours`: time span of the rolling window
+        - `restart_count`: replaced by delta for snapshot-sourced entries
+        - `lifetime_restart_count`: original lifetime value
+        - `snapshot_interval_hours`: time between current and previous snapshot
         """
+        # ── Window-based OOM count ──────────────────────────────────
+        # Scan ALL snapshots in the window to count how many had each
+        # workload as OOMKilled.  Uses workload_name (not pod name) to
+        # survive pod recreations.
+        oom_window = self._compute_oom_window_counts()
+
+        # ── Cross-snapshot restart delta (legacy) ───────────────────
         prev = self.get_previous_snapshot()
-        if not prev:
-            # First snapshot — can't compute delta.
-            # For snapshot-sourced entries, keep restart_count as-is (best effort).
-            return current_oom
-
-        # Compute interval between current and previous snapshot
         snaps = self._state["snapshots"]
-        current_ts_str = snaps[-1].get("timestamp", "")
-        prev_ts_str = prev.get("timestamp", "")
-        interval_hours = self._compute_interval_hours(current_ts_str, prev_ts_str)
-
-        # Build lookup: pod_key → restart_count from previous snapshot
+        interval_hours = None
         prev_restarts: dict[str, int] = {}
-        for o in prev.get("oomkilled_pods", []):
-            if o.get("source", "").startswith("snapshot_"):
-                ns = o.get("namespace", "")
-                name = o.get("name", "")
-                key = f"{ns}/{name}"
-                prev_restarts[key] = o.get("restart_count", 0)
+
+        if prev:
+            current_ts_str = snaps[-1].get("timestamp", "")
+            prev_ts_str = prev.get("timestamp", "")
+            interval_hours = self._compute_interval_hours(current_ts_str, prev_ts_str)
+
+            for o in prev.get("oomkilled_pods", []):
+                if o.get("source", "").startswith("snapshot_"):
+                    ns = o.get("namespace", "")
+                    name = o.get("name", "")
+                    key = f"{ns}/{name}"
+                    prev_restarts[key] = o.get("restart_count", 0)
 
         result = []
         for o in current_oom:
             if not o.get("source", "").startswith("snapshot_"):
-                # WOOP/API-sourced — already time-windowed
-                result.append(o)
+                # WOOP/API-sourced — already time-windowed.
+                # Still enrich with window count if available.
+                wl_key = f"{o.get('namespace', '')}/{o.get('workload_name', '') or o.get('name', '')}"
+                wc = oom_window.get("counts", {}).get(wl_key, 1)
+                result.append({
+                    **o,
+                    "oom_window_count": wc,
+                    "oom_window_hours": oom_window.get("span_hours", 0.0),
+                })
                 continue
 
             ns = o.get("namespace", "")
             name = o.get("name", "")
-            key = f"{ns}/{name}"
+            pod_key = f"{ns}/{name}"
+            wl_name = o.get("workload_name", "")
+            wl_key = f"{ns}/{wl_name}" if wl_name else pod_key
             lifetime_count = o.get("restart_count", 0)
 
-            if key in prev_restarts:
-                # Pod was in previous snapshot — compute genuine delta
-                delta = max(0, lifetime_count - prev_restarts[key])
-                enriched = {
-                    **o,
-                    "restart_count": delta,
-                    "lifetime_restart_count": lifetime_count,
-                    "snapshot_interval_hours": interval_hours,
-                }
+            enriched = {
+                **o,
+                "lifetime_restart_count": lifetime_count,
+                "oom_window_count": oom_window.get("counts", {}).get(wl_key, 1),
+                "oom_window_hours": oom_window.get("span_hours", 0.0),
+            }
+
+            if prev and pod_key in prev_restarts:
+                delta = max(0, lifetime_count - prev_restarts[pod_key])
+                enriched["restart_count"] = delta
+                enriched["snapshot_interval_hours"] = interval_hours
             else:
-                # Pod is new to OOM tracking — can't compute delta.
-                # Do NOT set snapshot_interval_hours so evaluator falls
-                # through to the cold-start fallback (pod age < 1h gate).
-                enriched = {
-                    **o,
-                    "restart_count": lifetime_count,
-                    "lifetime_restart_count": lifetime_count,
-                }
+                enriched["restart_count"] = lifetime_count
+
             result.append(enriched)
 
         return result
+
+    def _compute_oom_window_counts(self) -> dict:
+        """Count OOM appearances per workload across the rolling window.
+
+        Scans all snapshots and counts how many had each workload in the
+        oomkilled_pods list.  Uses workload_name (not pod name) so that
+        pod recreations within the window are counted as continued OOM
+        events rather than separate workloads.
+
+        Returns:
+            {
+                "counts": {"ns/workload_name": int, ...},
+                "span_hours": float,  # time span of the window
+            }
+        """
+        snaps = self._state["snapshots"]
+        if not snaps:
+            return {"counts": {}, "span_hours": 0.0}
+
+        # Compute window time span
+        first_ts = snaps[0].get("timestamp", "")
+        last_ts = snaps[-1].get("timestamp", "")
+        span_hours = self._compute_interval_hours(last_ts, first_ts) or 0.0
+
+        # Count per-workload OOM appearances
+        counts: dict[str, int] = {}
+        for snap in snaps:
+            # Track unique workloads per snapshot (don't double-count
+            # multiple containers of the same workload in one snapshot)
+            seen_this_snap: set[str] = set()
+            for o in snap.get("oomkilled_pods", []):
+                ns = o.get("namespace", "")
+                wl = o.get("workload_name", "")
+                if not wl:
+                    # Fallback: infer from pod name
+                    pod_name = o.get("name", "")
+                    parts = pod_name.rsplit("-", 2)
+                    wl = parts[0] if len(parts) >= 3 else pod_name
+                key = f"{ns}/{wl}"
+                if key not in seen_this_snap:
+                    seen_this_snap.add(key)
+                    counts[key] = counts.get(key, 0) + 1
+
+        return {"counts": counts, "span_hours": span_hours}
 
     @staticmethod
     def _compute_interval_hours(current_ts: str, prev_ts: str) -> float | None:
