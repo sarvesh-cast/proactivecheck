@@ -931,6 +931,16 @@ class Evaluator:
                     err_msg = wl_err.get("error", "unknown")
                     err_lower = err_msg.lower()
 
+                    # Skip stale/orphaned WOOP entries — namespace or workload
+                    # was deleted from the cluster but WOOP hasn't GC'd it yet.
+                    if "not found" in err_lower:
+                        logger.debug(
+                            "Suppressing stale WOOP error for %s "
+                            "(resource not found): %s",
+                            wl_key, err_msg[:80],
+                        )
+                        continue
+
                     # Classify error: recommendation timeout vs webhook vs generic
                     if "timed out" in err_lower and "recommendation" in err_lower:
                         # Transient-prone: require persistence across 2 consecutive snapshots

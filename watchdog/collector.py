@@ -1712,6 +1712,12 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
                     continue  # dedup: same workload can appear multiple times
                 seen_keys.add(wl_key)
                 error_msg = wl.get("error", wl.get("errorMessage", "unknown error"))
+                # Extract message from dict errors
+                # (e.g. {"type": "ERROR_DEPLOY_FAILED", "message": "..."})
+                if isinstance(error_msg, dict):
+                    error_msg = error_msg.get(
+                        "message", error_msg.get("type", str(error_msg))
+                    )
                 errors.append({"workload": wl_key, "error": str(error_msg)[:200]})
             snapshot.log_signals.append({
                 "signal": "woop_workload_errors",

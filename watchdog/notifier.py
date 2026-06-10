@@ -921,10 +921,19 @@ class Notifier:
         if kind:
             parts.append(kind)
         status = ev.get("woop_status", "")
-        if status and status != "MANAGED":
-            # Only show non-MANAGED status — MANAGED is the default/expected
+        if status:
             parts.append(status)
         return " · ".join(parts)
+
+    @staticmethod
+    def _workload_kind(ev: dict) -> str:
+        """Extract workload kind from evidence metadata."""
+        return ev.get("workload_kind", "-")
+
+    @staticmethod
+    def _woop_status(ev: dict) -> str:
+        """Extract WOOP status from evidence metadata."""
+        return ev.get("woop_status", "-")
 
     @staticmethod
     def _fmt_bytes(val, field_name: str = "") -> str:
@@ -988,10 +997,10 @@ class Notifier:
                 context_parts.append(f"rec {rec_str}")
             context = " → ".join(context_parts) if context_parts else "-"
 
-            tag = self._workload_tag(ev)
-            wl_display = f"{f.workload} ({tag})" if tag else f.workload
             rows.append([
-                wl_display,
+                f.workload,
+                self._workload_kind(ev),
+                self._woop_status(ev),
                 ev.get("container", "-"),
                 restarts,
                 context,
@@ -999,7 +1008,7 @@ class Notifier:
             causes.append(f"• `{f.workload}`: {f.what}")
 
         table = self._make_table(
-            ["Workload", "Container", "OOMs/1h", "Limit → Rec"],
+            ["Workload", "Kind", "WOOP", "Container", "OOMs/1h", "Limit → Rec"],
             rows,
         ) if rows else ""
         if len(findings) > 15:
@@ -1027,11 +1036,16 @@ class Notifier:
             else:
                 container = "-"
                 restarts = "?"
-            tag = self._workload_tag(ev if isinstance(ev, dict) else {})
-            wl_display = f"{f.workload} ({tag})" if tag else f.workload
-            rows.append([wl_display, container, restarts])
+            ev_dict = ev if isinstance(ev, dict) else {}
+            rows.append([
+                f.workload,
+                self._workload_kind(ev_dict),
+                self._woop_status(ev_dict),
+                container,
+                restarts,
+            ])
 
-        table = self._make_table(["Workload", "Container", "Restarts"], rows)
+        table = self._make_table(["Workload", "Kind", "WOOP", "Container", "Restarts"], rows)
         extra = f"\n_+{len(findings) - 15} more_" if len(findings) > 15 else ""
         return f"{header}{table}{extra}\n_→ {findings[0].suggested_action}_"
 
@@ -1176,17 +1190,17 @@ class Notifier:
             growth = ev.get("growth_pct", "?")
             current_mib = f"{trend[-1]:.0f} MiB" if trend else "?"
             trend_str = " → ".join(f"{v:.0f}" for v in trend[-4:]) if trend else "?"
-            tag = self._workload_tag(ev)
-            wl_display = f"{wl} ({tag})" if tag else wl
             rows.append([
-                wl_display,
+                wl,
+                self._workload_kind(ev),
+                self._woop_status(ev),
                 current_mib,
                 f"+{growth}%" if isinstance(growth, (int, float)) else str(growth),
                 trend_str,
             ])
             causes.append(f"• `{wl}`: {f.what}")
 
-        table = self._make_table(["Workload", "Current", "Growth", "Trend (MiB)"], rows)
+        table = self._make_table(["Workload", "Kind", "WOOP", "Current", "Growth", "Trend (MiB)"], rows)
         cause_text = "\n".join(causes[:5])
         return f"{header}{table}\n*Analysis:*\n{cause_text}\n_→ {findings[0].suggested_action}_"
 
