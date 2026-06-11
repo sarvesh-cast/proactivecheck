@@ -457,12 +457,18 @@ class StateManager:
         return result
 
     def _compute_oom_window_counts(self) -> dict:
-        """Count OOM appearances per workload across the rolling window.
+        """Count distinct OOM events per workload across the rolling window.
 
-        Scans all snapshots and counts how many had each workload in the
-        oomkilled_pods list.  Uses workload_name (not pod name) so that
-        pod recreations within the window are counted as continued OOM
-        events rather than separate workloads.
+        Scans all snapshots and counts how many *distinct* OOM events each
+        workload experienced.  Kubernetes ``lastState.terminated`` is sticky —
+        a single OOM shows up as ``reason: OOMKilled`` in every subsequent
+        snapshot until a newer termination overwrites it.  We deduplicate by
+        ``(workload_key, last_oomkill_time)``: the same workload with the
+        same ``last_oomkill_time`` across N snapshots counts as **1** event.
+
+        Uses workload_name (not pod name) so that pod recreations within the
+        window are counted as continued OOM events rather than separate
+        workloads.
 
         Returns:
             {
@@ -479,12 +485,12 @@ class StateManager:
         last_ts = snaps[-1].get("timestamp", "")
         span_hours = self._compute_interval_hours(last_ts, first_ts) or 0.0
 
-        # Count per-workload OOM appearances
-        counts: dict[str, int] = {}
+        # Track distinct OOM events per workload.
+        # Key = "ns/workload", value = set of unique OOM identifiers.
+        # An OOM is identified by (pod_name, last_oomkill_time) — if a pod
+        # has the same last_oomkill_time across snapshots, it's the same event.
+        seen_events: dict[str, set[tuple[str, str]]] = {}
         for snap in snaps:
-            # Track unique workloads per snapshot (don't double-count
-            # multiple containers of the same workload in one snapshot)
-            seen_this_snap: set[str] = set()
             for o in snap.get("oomkilled_pods", []):
                 ns = o.get("namespace", "")
                 wl = o.get("workload_name", "")
@@ -494,10 +500,16 @@ class StateManager:
                     parts = pod_name.rsplit("-", 2)
                     wl = parts[0] if len(parts) >= 3 else pod_name
                 key = f"{ns}/{wl}"
-                if key not in seen_this_snap:
-                    seen_this_snap.add(key)
-                    counts[key] = counts.get(key, 0) + 1
 
+                pod_name = o.get("name", "")
+                last_oom = o.get("last_oomkill_time", "")
+                event_id = (pod_name, last_oom)
+
+                if key not in seen_events:
+                    seen_events[key] = set()
+                seen_events[key].add(event_id)
+
+        counts = {k: len(v) for k, v in seen_events.items()}
         return {"counts": counts, "span_hours": span_hours}
 
     @staticmethod
