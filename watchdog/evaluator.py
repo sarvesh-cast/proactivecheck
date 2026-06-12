@@ -656,8 +656,8 @@ class Evaluator:
                 findings.append(Finding(
                     severity=Severity.CRITICAL,
                     category=FindingCategory.UNSCHEDULABLE,
-                    workload=f"{p.get('namespace', '')}/{p.get('name', '')}",
-                    what=f"Pod Pending for {p.get('age_minutes', 0):.0f} min — {p.get('reason', 'unknown reason')}",
+                    workload=f"{p.get('namespace', '')}/{p.get('workload_name', p.get('name', ''))}",
+                    what=f"Pod {p.get('name', '')} Pending for {p.get('age_minutes', 0):.0f} min — {p.get('reason', 'unknown reason')}",
                     evidence=json.dumps(p),
                     suggested_action="Check node capacity and resource requests",
                 ))

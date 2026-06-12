@@ -150,6 +150,7 @@ def analyze_pod_health(
             if is_unschedulable:
                 pending_details.append({
                     "namespace": ns, "name": name, "reason": reason,
+                    "workload_name": wl_name,
                 })
 
         # Agent pod detection

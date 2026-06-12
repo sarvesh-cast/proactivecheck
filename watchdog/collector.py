@@ -512,6 +512,7 @@ for pod in pods:
                 "namespace": ns,
                 "name": name,
                 "reason": reason,
+                "workload_name": wl_name,
             })
 
     # Only track the castai-agent deployment in castai-agent namespace.
@@ -1334,7 +1335,7 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
                             sched_false = True
                             pend_reason = cond.get("message", cond.get("reason", ""))
                 if not sched_seen or sched_false:
-                    pending_details.append({"namespace": ns, "name": name, "reason": pend_reason})
+                    pending_details.append({"namespace": ns, "name": name, "reason": pend_reason, "workload_name": wl_name})
 
             for cs in st.get("containerStatuses", []):
                 if isinstance(cs, dict):
@@ -1620,6 +1621,7 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
             client,
             f"/v1/workload-autoscaling/clusters/{self.cluster_id}/workloads",
             params=params, items_key="workloads",
+            max_pages=50,  # 5000 workloads at 100/page — covers large clusters
         )
 
         mgmt_map: dict[str, dict] = {}
@@ -1830,18 +1832,69 @@ result = {{"mismatches": mm, "absurd": ab, "data_gaps": dg, "summary": su, "rec_
     async def _paginated_get(
         self, client: httpx.AsyncClient, path: str,
         params: dict | None = None, items_key: str = "items",
-        max_pages: int = 20,
+        max_pages: int = 20, max_retries: int = 2,
     ) -> list:
+        """Paginate a GET endpoint, returning partial results on transient failure.
+
+        Retries each page up to *max_retries* times on 429/503/timeout with
+        exponential backoff.  If a page still fails after retries, returns
+        whatever was collected so far rather than raising — the caller gets
+        partial data instead of nothing.
+        """
         params = dict(params or {})
         params["page.limit"] = 100
         all_items = []
-        for _ in range(max_pages):
-            resp = await self._api_get(client, path, params)
-            if not resp:
-                break
-            all_items.extend(resp.get(items_key, []))
-            cursor = resp.get("nextCursor") or resp.get("page", {}).get("nextCursor")
-            if not cursor:
-                break
-            params["page.cursor"] = cursor
+        for page_num in range(max_pages):
+            last_err: Exception | None = None
+            for attempt in range(1 + max_retries):
+                try:
+                    resp = await self._api_get(client, path, params)
+                    if not resp:
+                        # Empty response — treat as end of data
+                        return all_items
+                    all_items.extend(resp.get(items_key, []))
+                    cursor = (
+                        resp.get("nextCursor")
+                        or resp.get("page", {}).get("nextCursor")
+                    )
+                    if not cursor:
+                        return all_items
+                    params["page.cursor"] = cursor
+                    last_err = None
+                    break  # page succeeded, move to next page
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    if status in (429, 503) and attempt < max_retries:
+                        wait = 2 ** attempt  # 1s, 2s
+                        logger.warning(
+                            "Paginated GET %s page %d: HTTP %d, retry %d/%d in %ds",
+                            path, page_num + 1, status, attempt + 1, max_retries, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        last_err = e
+                    else:
+                        last_err = e
+                        break  # non-retryable or retries exhausted
+                except httpx.TimeoutException as e:
+                    if attempt < max_retries:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "Paginated GET %s page %d: timeout, retry %d/%d in %ds",
+                            path, page_num + 1, attempt + 1, max_retries, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        last_err = e
+                    else:
+                        last_err = e
+                        break
+
+            if last_err is not None:
+                # Page failed after retries — return partial results
+                logger.warning(
+                    "Paginated GET %s: page %d failed after %d retries, "
+                    "returning %d items collected so far. Error: %s",
+                    path, page_num + 1, max_retries, len(all_items), last_err,
+                )
+                return all_items
+
         return all_items
